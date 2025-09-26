@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:installed_apps/app_info.dart';
 import 'package:installed_apps/installed_apps.dart';
 import 'package:usage_stats/usage_stats.dart';
@@ -17,7 +18,7 @@ class ScreenTimeApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Screen Time Tracker',
+      title: 'Doom Stake',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
@@ -47,6 +48,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   DateTime? _lastEventPollTime;
   final List<BlockedAppEntry> _blockedEntries = <BlockedAppEntry>[];
   final Map<String, DailyLimitEntry> _dailyLimits = {};
+  final ImagePicker _imagePicker = ImagePicker();
 
   bool get _isAndroid => !kIsWeb && Platform.isAndroid;
 
@@ -58,6 +60,78 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     _endDate = DateTime.now();
     _resetDailyLimitsIfNeeded();
     _initUsageAccess();
+  }
+
+  Future<void> _handleTouchGrassRequest() async {
+    if (!_isAndroid) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Camera unlock works only on Android for now.'),
+        ),
+      );
+      return;
+    }
+
+    if (_dailyLimits.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Set some app limits first!')),
+      );
+      return;
+    }
+
+    try {
+      final blockedEntries = _dailyLimits.values
+          .where((entry) => entry.isBlocked)
+          .toList();
+
+      if (blockedEntries.isEmpty) {
+        if (!mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('You have no blocked apps right now.')),
+        );
+        return;
+      }
+
+      final photo = await _imagePicker.pickImage(
+        source: ImageSource.camera,
+        preferredCameraDevice: CameraDevice.front,
+      );
+      if (photo == null) {
+        return;
+      }
+
+      setState(() {
+        for (final entry in blockedEntries) {
+          entry.extendLimit(const Duration(minutes: 1));
+        }
+      });
+
+      await _checkDailyLimits(DateTime.now());
+
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Grass touched! Limits extended by 1 minutes.'),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to access camera: $error')),
+      );
+    }
   }
 
   @override
@@ -114,7 +188,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   void _startUsageRefreshTimer() {
     _usageRefreshTimer?.cancel();
     _usageRefreshTimer = Timer.periodic(
-      const Duration(minutes: 5),
+      const Duration(minutes: 1),
       (_) => _loadUsageStats(),
     );
   }
@@ -359,9 +433,9 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       return;
     }
 
-    debugPrint(
-      'Daily limit usage snapshot: ${totals.map((k, v) => MapEntry(k, v.inSeconds))}',
-    );
+    // debugPrint(
+    //   'Daily limit usage snapshot: ${totals.map((k, v) => MapEntry(k, v.inSeconds))}',
+    // );
 
     bool updated = false;
     final newlyBlocked = <DailyLimitEntry>[];
@@ -473,7 +547,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
     final durationController = TextEditingController(text: '60');
-    final amountController = TextEditingController(text: '5');
+    final amountController = TextEditingController(text: '1');
     Set<String> selectedPackages = <String>{};
     String? errorMessage;
 
@@ -649,100 +723,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Widget _buildUsageContent() {
-    if (!_hasPermission) {
-      return Center(
-        child: _PermissionBanner(onGrantPermission: _openUsageSettings),
-      );
-    }
-
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    if (_errorMessage != null) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(_errorMessage!, textAlign: TextAlign.center),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: () => _loadUsageStats(),
-              child: const Text('Try again'),
-            ),
-          ],
-        ),
-      );
-    }
-
-    final totalTracked = _usageData.length;
-    final totalDuration = _usageData.fold<Duration>(
-      Duration.zero,
-      (sum, entry) => sum + entry.totalTime,
-    );
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              totalTracked == 0
-                  ? 'No usage recorded yet today.'
-                  : 'Time used today',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            if (totalTracked > 0)
-              Text(
-                'Combined foreground time: ${_formatDuration(totalDuration)}',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-            if (totalTracked > 0) ...[
-              const SizedBox(height: 12),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 200),
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: _usageData.length,
-                  separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (context, index) {
-                    final info = _usageData[index];
-                    return ListTile(
-                      dense: true,
-                      leading: info.icon != null
-                          ? CircleAvatar(
-                              backgroundImage: MemoryImage(info.icon!),
-                            )
-                          : CircleAvatar(
-                              child: Text(
-                                info.appName != null && info.appName!.isNotEmpty
-                                    ? info.appName![0].toUpperCase()
-                                    : '?',
-                              ),
-                            ),
-                      title: Text(info.appName ?? info.packageName),
-                      subtitle: Text(info.packageName),
-                      trailing: Text(_formatDuration(info.totalTime)),
-                    );
-                  },
-                ),
-              ),
-            ],
-            if (totalTracked == 0) ...[
-              const Text(
-                'We have not observed any app activity in the selected window.',
-              ),
-            ],
-            const SizedBox(height: 12),
-            const Text(
-              'Add a daily limit to block apps after 5 minutes of use.',
-            ),
-          ],
-        ),
-      ),
-    );
+    return const SizedBox.shrink();
   }
 
   List<BlockedAppEntry> _activeBlocks() {
@@ -831,19 +812,24 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text(
-              'Daily Limits',
+              'Stop the doom',
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
             Text(
-              'Set a 5-minute daily budget for selected apps. Once crossed, the app is blocked for the day.',
+              'Set a 1-minute limit for apps. Once crossed, the app is blocked for the day. To unlock, touch grass, literally!',
               style: Theme.of(context).textTheme.bodyMedium,
             ),
             const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: _showUsageLimitDialog,
-              icon: const Icon(Icons.timelapse),
-              label: const Text('Add Daily Limit'),
+              icon: const Icon(Icons.dangerous),
+              label: const Text('Block em all!'),
+            ),
+            const SizedBox(height: 8),
+            FilledButton(
+              onPressed: _handleTouchGrassRequest,
+              child: const Text('1 more minute pleaseeee!!'),
             ),
             const SizedBox(height: 12),
             if (entries.isEmpty)
@@ -890,7 +876,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       newLimits[app.packageName] = DailyLimitEntry(
         packageName: app.packageName,
         appName: app.name,
-        limit: const Duration(minutes: 5),
+        limit: const Duration(minutes: 1),
         day: DateTime(today.year, today.month, today.day),
         icon: app.icon,
       );
@@ -913,7 +899,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   Widget build(BuildContext context) {
     if (!_isAndroid) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Screen Time Tracker')),
+        appBar: AppBar(title: const Text('Doom Stake')),
         body: const Center(
           child: Padding(
             padding: EdgeInsets.all(24),
@@ -928,7 +914,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Screen Time Tracker'),
+        title: const Text('Doom Stake'),
         actions: [
           IconButton(
             onPressed: _isLoading || !_hasPermission
@@ -1264,7 +1250,7 @@ class DailyLimitEntry {
 
   final String packageName;
   final String appName;
-  final Duration limit;
+  Duration limit;
   final Uint8List? icon;
   DateTime day;
   Duration accumulated = Duration.zero;
@@ -1289,6 +1275,13 @@ class DailyLimitEntry {
     if (accumulated >= limit) {
       accumulated = limit;
       isBlocked = true;
+    }
+  }
+
+  void extendLimit(Duration additional) {
+    limit += additional;
+    if (accumulated < limit) {
+      isBlocked = false;
     }
   }
 }
