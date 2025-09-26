@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 import 'package:installed_apps/app_info.dart';
 import 'package:installed_apps/installed_apps.dart';
 import 'package:usage_stats/usage_stats.dart';
@@ -42,12 +42,13 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   late DateTime _endDate;
   List<AppUsageInfo> _usageData = const [];
   String? _errorMessage;
-  Timer? _refreshTimer;
-  final Set<String> _trackedPackages = <String>{};
-  final Map<String, AppInfo> _trackedAppInfo = <String, AppInfo>{};
+  Timer? _usageRefreshTimer;
+  Timer? _eventMonitorTimer;
+  DateTime? _lastEventPollTime;
+  final List<BlockedAppEntry> _blockedEntries = <BlockedAppEntry>[];
+  final Map<String, DailyLimitEntry> _dailyLimits = {};
 
   bool get _isAndroid => !kIsWeb && Platform.isAndroid;
-  bool get _isTrackingAll => _trackedPackages.isEmpty;
 
   @override
   void initState() {
@@ -55,13 +56,15 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     WidgetsBinding.instance.addObserver(this);
     _startDate = DateTime.now().subtract(const Duration(days: 1));
     _endDate = DateTime.now();
+    _resetDailyLimitsIfNeeded();
     _initUsageAccess();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _refreshTimer?.cancel();
+    _usageRefreshTimer?.cancel();
+    _eventMonitorTimer?.cancel();
     super.dispose();
   }
 
@@ -77,7 +80,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       setState(() {
         _hasPermission = false;
         _usageData = const [];
-        _trackedAppInfo.clear();
       });
       return;
     }
@@ -87,16 +89,14 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       return;
     }
 
-    final effectivePermission = permission ?? false;
-    if (!effectivePermission) {
-      _refreshTimer?.cancel();
-      if (_hasPermission || _usageData.isNotEmpty) {
-        setState(() {
-          _hasPermission = false;
-          _usageData = const [];
-          _trackedAppInfo.clear();
-        });
-      }
+    final hasPermission = permission ?? false;
+    if (!hasPermission) {
+      _usageRefreshTimer?.cancel();
+      _eventMonitorTimer?.cancel();
+      setState(() {
+        _hasPermission = false;
+        _usageData = const [];
+      });
       return;
     }
 
@@ -107,11 +107,37 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     }
 
     await _loadUsageStats();
-    _refreshTimer?.cancel();
-    _refreshTimer = Timer.periodic(
+    _startUsageRefreshTimer();
+    _startEventMonitor();
+  }
+
+  void _startUsageRefreshTimer() {
+    _usageRefreshTimer?.cancel();
+    _usageRefreshTimer = Timer.periodic(
       const Duration(minutes: 5),
       (_) => _loadUsageStats(),
     );
+  }
+
+  void _startEventMonitor() {
+    if (!_isAndroid || !_hasPermission) {
+      return;
+    }
+    if (_eventMonitorTimer != null) {
+      return;
+    }
+    _lastEventPollTime ??= DateTime.now().subtract(const Duration(minutes: 2));
+    _eventMonitorTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _checkBlockedViolations(),
+    );
+  }
+
+  void _stopEventMonitorIfIdle() {
+    if (_blockedEntries.isEmpty && _dailyLimits.isEmpty) {
+      _eventMonitorTimer?.cancel();
+      _eventMonitorTimer = null;
+    }
   }
 
   Future<void> _loadUsageStats() async {
@@ -147,50 +173,24 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       }
 
       final installedApps = await InstalledApps.getInstalledApps(true, true);
-
       if (!mounted) {
         return;
       }
 
-      final appsByPackage = <String, AppInfo>{};
-      for (final app in installedApps) {
-        appsByPackage[app.packageName] = app;
-      }
+      final appsByPackage = <String, AppInfo>{
+        for (final app in installedApps) app.packageName: app,
+      };
 
-      if (_trackedPackages.isNotEmpty) {
-        _trackedAppInfo
-          ..clear()
-          ..addEntries(
-            appsByPackage.entries.where(
-              (entry) => _trackedPackages.contains(entry.key),
-            ),
-          );
-      } else {
-        _trackedAppInfo.clear();
-      }
-
-      final results =
-          usageByPackage.entries
-              .where((entry) {
-                if (_trackedPackages.isEmpty) {
-                  return true;
-                }
-                return _trackedPackages.contains(entry.key);
-              })
-              .map((entry) {
-                final app = appsByPackage[entry.key];
-                final resolvedName = app?.name ?? entry.key;
-                final icon = app?.icon;
-
-                return AppUsageInfo(
-                  packageName: entry.key,
-                  totalTime: entry.value,
-                  appName: resolvedName,
-                  icon: icon,
-                );
-              })
-              .toList()
-            ..sort((a, b) => b.totalTime.compareTo(a.totalTime));
+      final results = usageByPackage.entries.map((entry) {
+        final app = appsByPackage[entry.key];
+        final resolvedName = app?.name ?? entry.key;
+        return AppUsageInfo(
+          packageName: entry.key,
+          totalTime: entry.value,
+          appName: resolvedName,
+          icon: app?.icon,
+        );
+      }).toList()..sort((a, b) => b.totalTime.compareTo(a.totalTime));
 
       setState(() {
         _usageData = results.take(50).toList(growable: false);
@@ -213,6 +213,218 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         });
       }
     }
+  }
+
+  Future<void> _checkBlockedViolations() async {
+    if (!_hasPermission || (_blockedEntries.isEmpty && _dailyLimits.isEmpty)) {
+      _stopEventMonitorIfIdle();
+      return;
+    }
+
+    final now = DateTime.now();
+    final activeEntries = _blockedEntries
+        .where((entry) => entry.blockedUntil.isAfter(now))
+        .toList();
+
+    final start =
+        _lastEventPollTime ?? now.subtract(const Duration(minutes: 2));
+    final end = now;
+    _lastEventPollTime = end;
+
+    try {
+      final events = await UsageStats.queryEvents(start, end);
+      if (!mounted) {
+        return;
+      }
+
+      if (activeEntries.isNotEmpty) {
+        setState(() {
+          _blockedEntries.removeWhere(
+            (entry) => entry.blockedUntil.isBefore(now),
+          );
+        });
+
+        for (final entry in activeEntries) {
+          if (entry.blockedUntil.isBefore(now)) {
+            continue;
+          }
+          if (entry.lastPromptTime != null &&
+              now.difference(entry.lastPromptTime!).inSeconds < 30) {
+            continue;
+          }
+          final wasOpened = events.any(
+            (event) => event.packageName == entry.packageName,
+          );
+          if (wasOpened) {
+            entry.lastPromptTime = now;
+            await _handleBlockedAttempt(entry);
+            if (!mounted) {
+              return;
+            }
+          }
+        }
+      }
+      await _checkDailyLimits(now);
+    } catch (error, stackTrace) {
+      debugPrint('Failed to monitor blocked apps: $error');
+      debugPrint('$stackTrace');
+    }
+  }
+
+  Future<void> _handleBlockedAttempt(BlockedAppEntry entry) async {
+    if (!mounted) {
+      return;
+    }
+
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('${entry.appName} is blocked'),
+          content: Text(
+            'You staked ${_formatCurrency(entry.stakeAmount)} to block this '
+            'app until ${_formatDateTime(entry.blockedUntil)}. '
+            'Opening it now will forfeit your stake. Continue?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Continue'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (result == true) {
+      debugPrint('Stake lost: ${entry.stakeAmount} USD on ${entry.appName}');
+      setState(() {
+        _blockedEntries.remove(entry);
+      });
+      _stopEventMonitorIfIdle();
+    } else {
+      debugPrint('Stake preserved for ${entry.appName}');
+    }
+  }
+
+  void _removeBlock(BlockedAppEntry entry) {
+    setState(() {
+      _blockedEntries.remove(entry);
+    });
+    _stopEventMonitorIfIdle();
+  }
+
+  void _resetDailyLimitsIfNeeded() {
+    final today = DateTime.now();
+    _dailyLimits.removeWhere((_, entry) => !_isSameDay(entry.day, today));
+  }
+
+  Future<void> _checkDailyLimits(DateTime now) async {
+    if (_dailyLimits.isEmpty) {
+      return;
+    }
+
+    for (final entry in _dailyLimits.values) {
+      if (!_isSameDay(entry.day, now)) {
+        entry.resetForDay(now);
+      }
+    }
+
+    final startOfDay = DateTime(now.year, now.month, now.day);
+    final stats = await UsageStats.queryUsageStats(startOfDay, now);
+    final totals = <String, Duration>{};
+
+    for (final info in stats) {
+      final package = info.packageName;
+      final totalForeground = info.totalTimeInForeground;
+      if (package == null || totalForeground == null) {
+        continue;
+      }
+
+      final millis = int.tryParse(totalForeground);
+      if (millis == null || millis <= 0) {
+        continue;
+      }
+
+      totals[package] =
+          (totals[package] ?? Duration.zero) + Duration(milliseconds: millis);
+    }
+
+    if (totals.isEmpty) {
+      return;
+    }
+
+    debugPrint(
+      'Daily limit usage snapshot: ${totals.map((k, v) => MapEntry(k, v.inSeconds))}',
+    );
+
+    bool updated = false;
+    final newlyBlocked = <DailyLimitEntry>[];
+
+    for (final entry in _dailyLimits.values) {
+      final usage = totals[entry.packageName] ?? Duration.zero;
+      final clamped = usage > entry.limit ? entry.limit : usage;
+      final wasBlocked = entry.isBlocked;
+
+      if (entry.accumulated != clamped ||
+          wasBlocked != (usage >= entry.limit)) {
+        entry.accumulated = clamped;
+        entry.isBlocked = usage >= entry.limit;
+        updated = true;
+
+        debugPrint(
+          'Daily limit update: ${entry.appName} -> '
+          '${entry.accumulated.inSeconds}s/${entry.limit.inSeconds}s '
+          '(blocked=${entry.isBlocked})',
+        );
+
+        if (!wasBlocked && entry.isBlocked) {
+          newlyBlocked.add(entry);
+        }
+      }
+    }
+
+    if (updated && mounted) {
+      setState(() {});
+    }
+
+    for (final entry in newlyBlocked) {
+      if (!mounted) {
+        break;
+      }
+      await _showDailyLimitOverlay(entry);
+    }
+  }
+
+  Future<void> _showDailyLimitOverlay(DailyLimitEntry entry) async {
+    if (!mounted) {
+      return;
+    }
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Daily limit reached'),
+          content: Text(
+            '${entry.appName} has exceeded the daily limit of '
+            '${_formatDuration(entry.limit)}. The app is blocked for today.',
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Future<void> _selectDateRange() async {
@@ -248,64 +460,453 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     await _initUsageAccess();
   }
 
-  Future<void> _openAppSelection() async {
-    if (!_isAndroid) {
+  Future<void> _showStakeDialog() async {
+    if (!_hasPermission) {
+      await _openUsageSettings();
       return;
     }
 
-    try {
-      final apps = await InstalledApps.getInstalledApps(true, true);
-      if (!mounted) {
-        return;
-      }
+    final apps = await InstalledApps.getInstalledApps(true, true);
+    if (!mounted) {
+      return;
+    }
+    apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
-      apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    final durationController = TextEditingController(text: '60');
+    final amountController = TextEditingController(text: '5');
+    Set<String> selectedPackages = <String>{};
+    String? errorMessage;
 
-      final result = await showModalBottomSheet<Set<String>>(
-        context: context,
-        isScrollControlled: true,
-        builder: (context) {
-          return _AppSelectionSheet(
-            apps: apps,
-            initiallySelected: _trackedPackages,
-          );
-        },
-      );
+    final request = await showDialog<_StakeRequest>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            final selectedApps = apps
+                .where((app) => selectedPackages.contains(app.packageName))
+                .toList();
+            return AlertDialog(
+              title: const Text('Stake & Block'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('Stake USD to block apps for a set duration.'),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: durationController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Block duration (minutes)',
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: amountController,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: const InputDecoration(
+                        labelText: 'Stake amount (USD)',
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton.tonalIcon(
+                      onPressed: () async {
+                        final result = await showModalBottomSheet<Set<String>>(
+                          context: context,
+                          isScrollControlled: true,
+                          builder: (context) => _AppSelectionSheet(
+                            apps: apps,
+                            initiallySelected: selectedPackages,
+                          ),
+                        );
+                        if (result != null) {
+                          setState(() {
+                            selectedPackages = result;
+                            errorMessage = null;
+                          });
+                        }
+                      },
+                      icon: const Icon(Icons.playlist_add),
+                      label: const Text('Select apps to block'),
+                    ),
+                    const SizedBox(height: 12),
+                    if (selectedApps.isEmpty)
+                      const Text(
+                        'No apps selected yet.',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                    if (selectedApps.isNotEmpty)
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: selectedApps
+                            .map((app) => Chip(label: Text(app.name)))
+                            .toList(),
+                      ),
+                    if (errorMessage != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        errorMessage!,
+                        style: const TextStyle(color: Colors.red),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final durationMinutes = int.tryParse(
+                      durationController.text.trim(),
+                    );
+                    final amount = double.tryParse(
+                      amountController.text.trim(),
+                    );
+                    if (durationMinutes == null || durationMinutes <= 0) {
+                      setState(() {
+                        errorMessage = 'Enter a valid duration (minutes).';
+                      });
+                      return;
+                    }
+                    if (amount == null || amount <= 0) {
+                      setState(() {
+                        errorMessage = 'Enter a valid stake amount.';
+                      });
+                      return;
+                    }
+                    if (selectedPackages.isEmpty) {
+                      setState(() {
+                        errorMessage = 'Select at least one app to block.';
+                      });
+                      return;
+                    }
 
-      if (result == null) {
-        return;
-      }
-
-      setState(() {
-        _trackedPackages
-          ..clear()
-          ..addAll(result);
-        if (_trackedPackages.isNotEmpty) {
-          _trackedAppInfo
-            ..clear()
-            ..addEntries(
-              apps
-                  .where((app) => _trackedPackages.contains(app.packageName))
-                  .map((app) => MapEntry(app.packageName, app)),
+                    final chosenApps = apps
+                        .where(
+                          (app) => selectedPackages.contains(app.packageName),
+                        )
+                        .toList(growable: false);
+                    Navigator.of(context).pop(
+                      _StakeRequest(
+                        duration: Duration(minutes: durationMinutes),
+                        amountUsd: amount,
+                        selectedApps: chosenApps,
+                      ),
+                    );
+                  },
+                  child: const Text('Stake & Block'),
+                ),
+              ],
             );
-        } else {
-          _trackedAppInfo.clear();
-        }
-      });
+          },
+        );
+      },
+    );
 
-      await _loadUsageStats();
-    } catch (error, stackTrace) {
-      debugPrint('Failed to open app selector: $error');
-      debugPrint('$stackTrace');
-      if (!mounted) {
-        return;
+    durationController.dispose();
+    amountController.dispose();
+
+    if (request == null) {
+      return;
+    }
+
+    _handleStakeRequest(request);
+  }
+
+  void _handleStakeRequest(_StakeRequest request) {
+    final blockedUntil = DateTime.now().add(request.duration);
+    final appNames = request.selectedApps.map((app) => app.name).join(', ');
+    debugPrint(
+      'Stake function called: amount=${request.amountUsd} USD, '
+      'duration=${request.duration.inMinutes} minutes, apps=[$appNames]',
+    );
+
+    setState(() {
+      for (final app in request.selectedApps) {
+        _blockedEntries.removeWhere(
+          (entry) => entry.packageName == app.packageName,
+        );
+        _blockedEntries.add(
+          BlockedAppEntry(
+            packageName: app.packageName,
+            appName: app.name,
+            blockedUntil: blockedUntil,
+            stakeAmount: request.amountUsd,
+            icon: app.icon,
+          ),
+        );
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Unable to load installed apps. Please try again.'),
+    });
+
+    _startEventMonitor();
+  }
+
+  Widget _buildUsageContent() {
+    if (!_hasPermission) {
+      return Center(
+        child: _PermissionBanner(onGrantPermission: _openUsageSettings),
+      );
+    }
+
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_errorMessage != null) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(_errorMessage!, textAlign: TextAlign.center),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: () => _loadUsageStats(),
+              child: const Text('Try again'),
+            ),
+          ],
         ),
       );
     }
+
+    final totalTracked = _usageData.length;
+    final totalDuration = _usageData.fold<Duration>(
+      Duration.zero,
+      (sum, entry) => sum + entry.totalTime,
+    );
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              totalTracked == 0
+                  ? 'No usage recorded yet today.'
+                  : 'Time used today',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            if (totalTracked > 0)
+              Text(
+                'Combined foreground time: ${_formatDuration(totalDuration)}',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            if (totalTracked > 0) ...[
+              const SizedBox(height: 12),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 200),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: _usageData.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final info = _usageData[index];
+                    return ListTile(
+                      dense: true,
+                      leading: info.icon != null
+                          ? CircleAvatar(
+                              backgroundImage: MemoryImage(info.icon!),
+                            )
+                          : CircleAvatar(
+                              child: Text(
+                                info.appName != null && info.appName!.isNotEmpty
+                                    ? info.appName![0].toUpperCase()
+                                    : '?',
+                              ),
+                            ),
+                      title: Text(info.appName ?? info.packageName),
+                      subtitle: Text(info.packageName),
+                      trailing: Text(_formatDuration(info.totalTime)),
+                    );
+                  },
+                ),
+              ),
+            ],
+            if (totalTracked == 0) ...[
+              const Text(
+                'We have not observed any app activity in the selected window.',
+              ),
+            ],
+            const SizedBox(height: 12),
+            const Text(
+              'Add a daily limit to block apps after 5 minutes of use.',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<BlockedAppEntry> _activeBlocks() {
+    final now = DateTime.now();
+    final expired = <BlockedAppEntry>[];
+    final active = <BlockedAppEntry>[];
+
+    for (final entry in _blockedEntries) {
+      if (entry.blockedUntil.isAfter(now)) {
+        active.add(entry);
+      } else {
+        expired.add(entry);
+      }
+    }
+
+    if (expired.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _blockedEntries.removeWhere(expired.contains);
+        });
+        _stopEventMonitorIfIdle();
+      });
+    }
+
+    return active;
+  }
+
+  Widget _buildStakePanel() {
+    final activeBlocks = _activeBlocks();
+    final rangeLabel = '${_formatDate(_startDate)} - ${_formatDate(_endDate)}';
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Stake & Block',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Stake USD to block distracting apps for a custom time period.',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _showStakeDialog,
+              icon: const Icon(Icons.shield),
+              label: const Text('Stake & Block'),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Usage window: $rangeLabel',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            if (activeBlocks.isEmpty) const Text('No active blocks yet.'),
+            if (activeBlocks.isNotEmpty) ...[
+              const Text('Active blocks:'),
+              const SizedBox(height: 8),
+              for (final entry in activeBlocks)
+                _ActiveBlockTile(
+                  entry: entry,
+                  onRemove: () => _removeBlock(entry),
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLimitsPanel() {
+    final entries = _dailyLimits.values.toList()
+      ..sort((a, b) => a.appName.compareTo(b.appName));
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Daily Limits',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Set a 5-minute daily budget for selected apps. Once crossed, the app is blocked for the day.',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _showUsageLimitDialog,
+              icon: const Icon(Icons.timelapse),
+              label: const Text('Add Daily Limit'),
+            ),
+            const SizedBox(height: 12),
+            if (entries.isEmpty)
+              const Text('No daily limits yet.')
+            else ...[
+              for (final entry in entries)
+                _DailyLimitTile(
+                  entry: entry,
+                  onRemove: () => _removeDailyLimit(entry.packageName),
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showUsageLimitDialog() async {
+    final apps = await InstalledApps.getInstalledApps(true, true);
+    if (!mounted) {
+      return;
+    }
+    apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+
+    final selected = await showModalBottomSheet<Set<String>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => _AppSelectionSheet(
+        apps: apps,
+        initiallySelected: _dailyLimits.keys.toSet(),
+      ),
+    );
+
+    if (selected == null || selected.isEmpty) {
+      return;
+    }
+
+    final today = DateTime.now();
+    final newLimits = <String, DailyLimitEntry>{};
+    for (final app in apps) {
+      if (!selected.contains(app.packageName)) {
+        continue;
+      }
+      newLimits[app.packageName] = DailyLimitEntry(
+        packageName: app.packageName,
+        appName: app.name,
+        limit: const Duration(minutes: 5),
+        day: DateTime(today.year, today.month, today.day),
+        icon: app.icon,
+      );
+    }
+
+    setState(() {
+      _dailyLimits
+        ..clear()
+        ..addAll(newLimits);
+    });
+  }
+
+  void _removeDailyLimit(String packageName) {
+    setState(() {
+      _dailyLimits.remove(packageName);
+    });
   }
 
   @override
@@ -341,39 +942,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             icon: const Icon(Icons.calendar_today),
             tooltip: 'Select date range',
           ),
-          PopupMenuButton<_OverflowAction>(
-            onSelected: (action) {
-              switch (action) {
-                case _OverflowAction.manageTrackedApps:
-                  _openAppSelection();
-                  break;
-                case _OverflowAction.trackAll:
-                  setState(() {
-                    _trackedPackages.clear();
-                    _trackedAppInfo.clear();
-                  });
-                  _loadUsageStats();
-                  break;
-              }
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem<_OverflowAction>(
-                value: _OverflowAction.manageTrackedApps,
-                child: ListTile(
-                  leading: Icon(Icons.playlist_add),
-                  title: Text('Add apps to track'),
-                ),
-              ),
-              PopupMenuItem<_OverflowAction>(
-                value: _OverflowAction.trackAll,
-                enabled: !_isTrackingAll,
-                child: const ListTile(
-                  leading: Icon(Icons.select_all),
-                  title: Text('Track all apps'),
-                ),
-              ),
-            ],
-          ),
         ],
       ),
       body: Padding(
@@ -381,94 +949,14 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _DateRangeSummary(startDate: _startDate, endDate: _endDate),
-            const SizedBox(height: 12),
+            _buildStakePanel(),
+            const SizedBox(height: 16),
+            _buildLimitsPanel(),
+            const SizedBox(height: 16),
             Expanded(child: _buildUsageContent()),
           ],
         ),
       ),
-      floatingActionButton: _hasPermission
-          ? FloatingActionButton.extended(
-              onPressed: _isLoading ? null : () => _loadUsageStats(),
-              icon: const Icon(Icons.refresh),
-              label: const Text('Refresh'),
-            )
-          : FloatingActionButton.extended(
-              onPressed: _openUsageSettings,
-              icon: const Icon(Icons.settings),
-              label: const Text('Grant Access'),
-            ),
-    );
-  }
-
-  Widget _buildUsageContent() {
-    if (!_hasPermission) {
-      return Center(
-        child: _PermissionBanner(onGrantPermission: _openUsageSettings),
-      );
-    }
-
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    if (_errorMessage != null) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(_errorMessage!, textAlign: TextAlign.center),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: () => _loadUsageStats(),
-              child: const Text('Try again'),
-            ),
-          ],
-        ),
-      );
-    }
-
-    final listView = Expanded(
-      child: _usageData.isEmpty
-          ? Center(
-              child: Text(
-                _isTrackingAll
-                    ? 'No usage data available for the selected period.'
-                    : 'None of the tracked apps have usage in this period.',
-                textAlign: TextAlign.center,
-              ),
-            )
-          : ListView.separated(
-              itemCount: _usageData.length,
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemBuilder: (context, index) {
-                final info = _usageData[index];
-                return _AppUsageTile(info: info);
-              },
-            ),
-    );
-
-    return Column(
-      children: [
-        if (!_isTrackingAll && _trackedPackages.isNotEmpty) ...[
-          _TrackedAppsBanner(
-            count: _trackedPackages.length,
-            appNames: _trackedPackages
-                .map((pkg) => _trackedAppInfo[pkg]?.name ?? pkg)
-                .toList(growable: false),
-            onClear: () {
-              setState(() {
-                _trackedPackages.clear();
-                _trackedAppInfo.clear();
-              });
-              _loadUsageStats();
-            },
-            onManage: _openAppSelection,
-          ),
-          const SizedBox(height: 12),
-        ],
-        listView,
-      ],
     );
   }
 }
@@ -492,67 +980,6 @@ class AppUsageInfo {
       totalTime: totalTime,
       appName: appName ?? this.appName,
       icon: icon ?? this.icon,
-    );
-  }
-}
-
-class _AppUsageTile extends StatelessWidget {
-  const _AppUsageTile({required this.info});
-
-  final AppUsageInfo info;
-
-  @override
-  Widget build(BuildContext context) {
-    final formattedDuration = _formatDuration(info.totalTime);
-    return ListTile(
-      leading: info.icon != null
-          ? CircleAvatar(backgroundImage: MemoryImage(info.icon!))
-          : CircleAvatar(
-              child: Text(
-                info.appName != null && info.appName!.isNotEmpty
-                    ? info.appName![0].toUpperCase()
-                    : '?',
-              ),
-            ),
-      title: Text(info.appName ?? info.packageName),
-      subtitle: Text(info.packageName),
-      trailing: Text(formattedDuration),
-    );
-  }
-}
-
-class _DateRangeSummary extends StatelessWidget {
-  const _DateRangeSummary({required this.startDate, required this.endDate});
-
-  final DateTime startDate;
-  final DateTime endDate;
-
-  @override
-  Widget build(BuildContext context) {
-    final formatter = DateFormat('MMM d, yyyy');
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Tracking window',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  '${formatter.format(startDate)} - ${formatter.format(endDate)}',
-                ),
-              ],
-            ),
-            const Icon(Icons.calendar_month),
-          ],
-        ),
-      ),
     );
   }
 }
@@ -596,59 +1023,57 @@ class _PermissionBanner extends StatelessWidget {
   }
 }
 
-class _TrackedAppsBanner extends StatelessWidget {
-  const _TrackedAppsBanner({
-    required this.count,
-    required this.appNames,
-    required this.onClear,
-    required this.onManage,
-  });
+class _ActiveBlockTile extends StatelessWidget {
+  const _ActiveBlockTile({required this.entry, required this.onRemove});
 
-  final int count;
-  final List<String> appNames;
-  final VoidCallback onClear;
-  final VoidCallback onManage;
+  final BlockedAppEntry entry;
+  final VoidCallback onRemove;
 
   @override
   Widget build(BuildContext context) {
-    final displayNames = appNames.take(3).join(', ');
-    final remaining = count - appNames.take(3).length;
+    final remaining = entry.blockedUntil.difference(DateTime.now());
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: entry.icon != null
+          ? CircleAvatar(backgroundImage: MemoryImage(entry.icon!))
+          : const CircleAvatar(child: Icon(Icons.block)),
+      title: Text(entry.appName),
+      subtitle: Text(
+        'Time left: ${_formatRemainingDuration(remaining)} • '
+        'Stake ${_formatCurrency(entry.stakeAmount)}',
+      ),
+      trailing: IconButton(
+        icon: const Icon(Icons.close),
+        onPressed: onRemove,
+        tooltip: 'Remove block',
+      ),
+    );
+  }
+}
 
-    return Card(
-      color: Colors.green.shade50,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Tracking $count app${count == 1 ? '' : 's'}',
-              style: const TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              remaining > 0 ? '$displayNames +$remaining more' : displayNames,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                TextButton.icon(
-                  onPressed: onManage,
-                  icon: const Icon(Icons.playlist_add),
-                  label: const Text('Manage'),
-                ),
-                const SizedBox(width: 8),
-                TextButton.icon(
-                  onPressed: onClear,
-                  icon: const Icon(Icons.clear),
-                  label: const Text('Clear'),
-                ),
-              ],
-            ),
-          ],
-        ),
+class _DailyLimitTile extends StatelessWidget {
+  const _DailyLimitTile({required this.entry, required this.onRemove});
+
+  final DailyLimitEntry entry;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: entry.icon != null
+          ? CircleAvatar(backgroundImage: MemoryImage(entry.icon!))
+          : const CircleAvatar(child: Icon(Icons.hourglass_top)),
+      title: Text(entry.appName),
+      subtitle: Text(
+        entry.isBlocked
+            ? 'Blocked for today'
+            : 'Time used: ${_formatDuration(entry.accumulated)}',
+      ),
+      trailing: IconButton(
+        icon: const Icon(Icons.close),
+        tooltip: 'Remove limit',
+        onPressed: onRemove,
       ),
     );
   }
@@ -668,7 +1093,7 @@ class _AppSelectionSheet extends StatefulWidget {
 }
 
 class _AppSelectionSheetState extends State<_AppSelectionSheet> {
-  late final Set<String> _selectedPackages;
+  late Set<String> _selectedPackages;
   String _filter = '';
 
   @override
@@ -690,7 +1115,9 @@ class _AppSelectionSheetState extends State<_AppSelectionSheet> {
 
     return SafeArea(
       child: Padding(
-        padding: const EdgeInsets.only(bottom: 16),
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.of(context).viewInsets.bottom,
+        ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -709,7 +1136,7 @@ class _AppSelectionSheetState extends State<_AppSelectionSheet> {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   const Text(
-                    'Select apps to track',
+                    'Select apps to block',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                   TextButton(
@@ -739,8 +1166,9 @@ class _AppSelectionSheetState extends State<_AppSelectionSheet> {
               ),
             ),
             const SizedBox(height: 12),
-            Expanded(
+            Flexible(
               child: ListView.builder(
+                shrinkWrap: true,
                 itemCount: filteredApps.length,
                 itemBuilder: (context, index) {
                   final app = filteredApps[index];
@@ -796,7 +1224,74 @@ class _AppSelectionSheetState extends State<_AppSelectionSheet> {
   }
 }
 
-enum _OverflowAction { manageTrackedApps, trackAll }
+class BlockedAppEntry {
+  BlockedAppEntry({
+    required this.packageName,
+    required this.appName,
+    required this.blockedUntil,
+    required this.stakeAmount,
+    this.icon,
+  });
+
+  final String packageName;
+  final String appName;
+  final DateTime blockedUntil;
+  final double stakeAmount;
+  final Uint8List? icon;
+  DateTime? lastPromptTime;
+}
+
+class _StakeRequest {
+  const _StakeRequest({
+    required this.duration,
+    required this.amountUsd,
+    required this.selectedApps,
+  });
+
+  final Duration duration;
+  final double amountUsd;
+  final List<AppInfo> selectedApps;
+}
+
+class DailyLimitEntry {
+  DailyLimitEntry({
+    required this.packageName,
+    required this.appName,
+    required this.limit,
+    required this.day,
+    this.icon,
+  });
+
+  final String packageName;
+  final String appName;
+  final Duration limit;
+  final Uint8List? icon;
+  DateTime day;
+  Duration accumulated = Duration.zero;
+  bool isBlocked = false;
+
+  void resetForDay(DateTime newDay) {
+    day = DateTime(newDay.year, newDay.month, newDay.day);
+    accumulated = Duration.zero;
+    isBlocked = false;
+  }
+
+  Duration get remaining {
+    final diff = limit - accumulated;
+    return diff.isNegative ? Duration.zero : diff;
+  }
+
+  void addUsage(Duration amount) {
+    if (isBlocked) {
+      return;
+    }
+    accumulated += amount;
+    if (accumulated >= limit) {
+      accumulated = limit;
+      isBlocked = true;
+    }
+  }
+}
 
 String _formatDuration(Duration duration) {
   final hours = duration.inHours;
@@ -810,4 +1305,35 @@ String _formatDuration(Duration duration) {
     return '${minutes}m ${seconds}s';
   }
   return '${seconds}s';
+}
+
+String _formatRemainingDuration(Duration duration) {
+  if (duration.isNegative) {
+    return 'Expired';
+  }
+  final hours = duration.inHours;
+  final minutes = duration.inMinutes.remainder(60);
+  if (hours > 0) {
+    return '${hours}h ${minutes}m';
+  }
+  return '${minutes}m';
+}
+
+String _formatCurrency(double amount) {
+  return '  ${amount.toStringAsFixed(2)}';
+}
+
+String _formatDate(DateTime date) {
+  return '${date.month}/${date.day}/${date.year}';
+}
+
+String _formatDateTime(DateTime date) {
+  final hour12 = date.hour % 12 == 0 ? 12 : date.hour % 12;
+  final minute = date.minute.toString().padLeft(2, '0');
+  final period = date.hour >= 12 ? 'PM' : 'AM';
+  return '${_formatDate(date)} $hour12:$minute $period';
+}
+
+bool _isSameDay(DateTime a, DateTime b) {
+  return a.year == b.year && a.month == b.month && a.day == b.day;
 }
