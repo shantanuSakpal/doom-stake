@@ -187,10 +187,10 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
   void _startUsageRefreshTimer() {
     _usageRefreshTimer?.cancel();
-    _usageRefreshTimer = Timer.periodic(
-      const Duration(minutes: 1),
-      (_) => _loadUsageStats(),
-    );
+    _usageRefreshTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      _loadUsageStats();
+      _checkDailyLimits(DateTime.now());
+    });
   }
 
   void _startEventMonitor() {
@@ -594,6 +594,19 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                           builder: (context) => _AppSelectionSheet(
                             apps: apps,
                             initiallySelected: selectedPackages,
+                            usageLookup: {
+                              for (final app in apps)
+                                app.packageName: _usageData.firstWhere(
+                                  (usage) =>
+                                      usage.packageName == app.packageName,
+                                  orElse: () => AppUsageInfo(
+                                    packageName: app.packageName,
+                                    totalTime: Duration.zero,
+                                    appName: app.name,
+                                    icon: app.icon,
+                                  ),
+                                ),
+                            },
                           ),
                         );
                         if (result != null) {
@@ -840,6 +853,35 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                   entry: entry,
                   onRemove: () => _removeDailyLimit(entry.packageName),
                 ),
+              const SizedBox(height: 12),
+              Text(
+                'Current time limits',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+              const SizedBox(height: 8),
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    for (final entry in entries)
+                      Container(
+                        margin: const EdgeInsets.only(right: 8),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.surfaceVariant,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Text(
+                          '${entry.appName}: ${_formatDuration(entry.limit)}',
+                          style: Theme.of(context).textTheme.labelMedium,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             ],
           ],
         ),
@@ -854,12 +896,17 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     }
     apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
+    final usageSnapshot = {
+      for (final entry in _usageData) entry.packageName: entry,
+    };
+
     final selected = await showModalBottomSheet<Set<String>>(
       context: context,
       isScrollControlled: true,
       builder: (context) => _AppSelectionSheet(
         apps: apps,
         initiallySelected: _dailyLimits.keys.toSet(),
+        usageLookup: usageSnapshot,
       ),
     );
 
@@ -1069,10 +1116,12 @@ class _AppSelectionSheet extends StatefulWidget {
   const _AppSelectionSheet({
     required this.apps,
     required this.initiallySelected,
+    required this.usageLookup,
   });
 
   final List<AppInfo> apps;
   final Set<String> initiallySelected;
+  final Map<String, AppUsageInfo> usageLookup;
 
   @override
   State<_AppSelectionSheet> createState() => _AppSelectionSheetState();
@@ -1161,6 +1210,10 @@ class _AppSelectionSheetState extends State<_AppSelectionSheet> {
                   final isSelected = _selectedPackages.contains(
                     app.packageName,
                   );
+                  final usage = widget.usageLookup[app.packageName];
+                  final usageLabel = usage == null
+                      ? 'No usage today'
+                      : 'Used ${_formatDuration(usage.totalTime)} today';
                   return CheckboxListTile(
                     value: isSelected,
                     onChanged: (selected) {
@@ -1173,7 +1226,7 @@ class _AppSelectionSheetState extends State<_AppSelectionSheet> {
                       });
                     },
                     title: Text(app.name),
-                    subtitle: Text(app.packageName),
+                    subtitle: Text(usageLabel),
                     secondary: app.icon != null
                         ? CircleAvatar(backgroundImage: MemoryImage(app.icon!))
                         : const CircleAvatar(child: Icon(Icons.apps)),
