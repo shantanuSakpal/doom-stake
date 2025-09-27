@@ -13,6 +13,14 @@ import 'package:http/http.dart' as http;
 import 'package:android_intent_plus/android_intent.dart';
 import 'package:android_intent_plus/flag.dart';
 import 'package:system_alert_window/system_alert_window.dart';
+// Web3Auth imports
+import 'package:web3auth_flutter/enums.dart';
+import 'package:web3auth_flutter/input.dart';
+import 'package:web3auth_flutter/output.dart';
+import 'package:web3auth_flutter/web3auth_flutter.dart';
+import 'package:web3dart/web3dart.dart';
+import 'package:http/http.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 @pragma("vm:entry-point")
 void overlayMain() {
@@ -83,6 +91,48 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   final Map<String, DailyLimitEntry> _dailyLimits = {};
   final ImagePicker _imagePicker = ImagePicker();
   bool _showingOverlay = false;
+  // Web3Auth state
+  bool _isLoggedIn = false;
+  String _address = '';
+  final String _rpcUrl = 'https://1rpc.io/sepolia';
+
+  Future<void> _loginWithEmailPasswordless(String email) async {
+    try {
+      final response = await Web3AuthFlutter.login(
+        LoginParams(
+          loginProvider: Provider.email_passwordless,
+          extraLoginOptions: ExtraLoginOptions(login_hint: email),
+        ),
+      );
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('privateKey', response.privKey ?? '');
+
+      final creds = EthPrivateKey.fromHex(response.privKey!);
+      final addr = creds.address.hexEip55;
+
+      setState(() {
+        _isLoggedIn = true;
+        _address = addr;
+      });
+    } catch (e) {
+      debugPrint("Login failed: $e");
+    }
+  }
+
+  Future<void> _logout() async {
+    try {
+      await Web3AuthFlutter.logout();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('privateKey');
+      setState(() {
+        _isLoggedIn = false;
+        _address = '';
+      });
+    } catch (e) {
+      debugPrint("Logout failed: $e");
+    }
+  }
 
   bool get _isAndroid => !kIsWeb && Platform.isAndroid;
 
@@ -90,6 +140,37 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     await SystemAlertWindow.requestPermissions(
       prefMode: SystemWindowPrefMode.OVERLAY,
     );
+  }
+
+  Future<void> _initWeb3Auth() async {
+    Uri redirectUrl;
+    const clientId = 'id'; // Replace with your actual clientId
+
+    if (Platform.isAndroid) {
+      redirectUrl = Uri.parse(
+        'w3a://com.example.touchgrass',
+      ); // match package name
+    } else if (Platform.isIOS) {
+      redirectUrl = Uri.parse('com.example.touchgrass://auth');
+    } else {
+      return;
+    }
+
+    await Web3AuthFlutter.init(
+      Web3AuthOptions(
+        clientId: clientId,
+        network: Network.sapphire_devnet,
+        redirectUrl: redirectUrl,
+        buildEnv: BuildEnv.production,
+        sessionTime: 86400,
+      ),
+    );
+
+    try {
+      await Web3AuthFlutter.initialize();
+    } catch (e) {
+      debugPrint("Web3Auth init error: $e");
+    }
   }
 
   @override
@@ -104,6 +185,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     _requestOverlayPermission();
 
     _initUsageAccess();
+    _initWeb3Auth();
   }
 
   Future<void> _handleTouchGrassRequest() async {
@@ -975,6 +1057,46 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     );
   }
 
+  Widget _buildWeb3AuthPanel() {
+    final emailController = TextEditingController();
+
+    if (!_isLoggedIn) {
+      return Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              const Text("Login with Web3Auth"),
+              TextField(
+                controller: emailController,
+                decoration: const InputDecoration(labelText: "Enter Email"),
+              ),
+              const SizedBox(height: 8),
+              ElevatedButton(
+                onPressed: () =>
+                    _loginWithEmailPasswordless(emailController.text),
+                child: const Text("Login"),
+              ),
+            ],
+          ),
+        ),
+      );
+    } else {
+      return Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              Text("Logged in as: $_address"),
+              const SizedBox(height: 8),
+              ElevatedButton(onPressed: _logout, child: const Text("Logout")),
+            ],
+          ),
+        ),
+      );
+    }
+  }
+
   Widget _buildLimitsPanel() {
     final entries = _dailyLimits.values.toList()
       ..sort((a, b) => a.appName.compareTo(b.appName));
@@ -1143,6 +1265,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            _buildWeb3AuthPanel(),
             _buildStakePanel(),
             const SizedBox(height: 16),
             _buildLimitsPanel(),
