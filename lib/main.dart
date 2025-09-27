@@ -21,6 +21,7 @@ import 'package:web3auth_flutter/web3auth_flutter.dart';
 import 'package:web3dart/web3dart.dart';
 import 'package:http/http.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 @pragma("vm:entry-point")
 void overlayMain() {
@@ -41,8 +42,11 @@ void overlayMain() {
   );
 }
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Load .env before anything else
+  await dotenv.load(fileName: ".env");
 
   // Listen for clicks from overlay buttons
   SystemAlertWindow.overlayListener.listen((event) async {
@@ -144,7 +148,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
   Future<void> _initWeb3Auth() async {
     Uri redirectUrl;
-    const clientId = 'id'; // Replace with your actual clientId
+    final clientId = dotenv.env['WEB3AUTH_CLIENT_ID'] ?? '';
 
     if (Platform.isAndroid) {
       redirectUrl = Uri.parse(
