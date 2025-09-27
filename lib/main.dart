@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -9,8 +10,39 @@ import 'package:installed_apps/app_info.dart';
 import 'package:installed_apps/installed_apps.dart';
 import 'package:usage_stats/usage_stats.dart';
 import 'package:http/http.dart' as http;
+import 'package:android_intent_plus/android_intent.dart';
+import 'package:android_intent_plus/flag.dart';
+import 'package:system_alert_window/system_alert_window.dart';
 
-void main() {
+@pragma("vm:entry-point")
+void overlayMain() {
+  runApp(
+    const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Material(
+        color: Colors.black54,
+        child: Center(
+          child: Text(
+            'App Blocked\nTouch grass to unlock 🌿',
+            style: TextStyle(color: Colors.white, fontSize: 20),
+            textAlign: TextAlign.center,
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Listen for clicks from overlay buttons
+  SystemAlertWindow.overlayListener.listen((event) async {
+    if (event == "close_overlay") {
+      await SystemAlertWindow.closeSystemWindow();
+    }
+  });
+
   runApp(const ScreenTimeApp());
 }
 
@@ -44,15 +76,21 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   late DateTime _startDate;
   late DateTime _endDate;
   List<AppUsageInfo> _usageData = const [];
-  String? _errorMessage;
   Timer? _usageRefreshTimer;
   Timer? _eventMonitorTimer;
   DateTime? _lastEventPollTime;
   final List<BlockedAppEntry> _blockedEntries = <BlockedAppEntry>[];
   final Map<String, DailyLimitEntry> _dailyLimits = {};
   final ImagePicker _imagePicker = ImagePicker();
+  bool _showingOverlay = false;
 
   bool get _isAndroid => !kIsWeb && Platform.isAndroid;
+
+  Future<void> _requestOverlayPermission() async {
+    await SystemAlertWindow.requestPermissions(
+      prefMode: SystemWindowPrefMode.OVERLAY,
+    );
+  }
 
   @override
   void initState() {
@@ -61,6 +99,10 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     _startDate = DateTime.now().subtract(const Duration(days: 1));
     _endDate = DateTime.now();
     _resetDailyLimitsIfNeeded();
+
+    // Request overlay permission when app starts
+    _requestOverlayPermission();
+
     _initUsageAccess();
   }
 
@@ -180,7 +222,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<_UploadResult> _uploadPhoto(XFile photo) async {
-    final uri = Uri.parse('https://bab5e820daa4.ngrok-free.app/upload-image');
+    final uri = Uri.parse('https://6bc2a30c273e.ngrok-free.app/upload-image');
     try {
       final request = http.MultipartRequest('POST', uri)
         ..files.add(await http.MultipartFile.fromPath('image', photo.path));
@@ -219,6 +261,41 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       debugPrint('$stackTrace');
     }
     return const _UploadResult(uploaded: false);
+  }
+
+  Future<void> _bringAppToFront() async {
+    const packageName = 'com.example.touch_grass';
+    debugPrint('[BringAppToFront] Trying to launch $packageName');
+
+    try {
+      // final intent = AndroidIntent(
+      //   action: 'android.intent.action.MAIN',
+      //   category: 'android.intent.category.LAUNCHER',
+      //   package: packageName,
+      //   flags: <int>[
+      //     Flag.FLAG_ACTIVITY_NEW_TASK,
+      //     Flag.FLAG_ACTIVITY_REORDER_TO_FRONT,
+      //   ],
+      // );
+      // await intent.launch();
+      // debugPrint('[BringAppToFront] Relaunched app successfully');
+      // Fallback to home screen if the system shows a popup
+      final homeIntent = AndroidIntent(
+        action: 'android.intent.action.MAIN',
+        category: 'android.intent.category.HOME',
+        flags: <int>[Flag.FLAG_ACTIVITY_NEW_TASK],
+      );
+      await homeIntent.launch();
+    } catch (e) {
+      debugPrint('[BringAppToFront] Launch failed ($e), sending HOME intent');
+      // Fallback to home screen if the system shows a popup
+      final homeIntent = AndroidIntent(
+        action: 'android.intent.action.MAIN',
+        category: 'android.intent.category.HOME',
+        flags: <int>[Flag.FLAG_ACTIVITY_NEW_TASK],
+      );
+      await homeIntent.launch();
+    }
   }
 
   @override
@@ -308,7 +385,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
     setState(() {
       _isLoading = true;
-      _errorMessage = null;
     });
 
     try {
@@ -355,7 +431,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
       setState(() {
         _usageData = results.take(50).toList(growable: false);
-        _errorMessage = null;
       });
     } catch (error, stackTrace) {
       debugPrint('Failed to load usage stats: $error');
@@ -365,7 +440,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       }
       setState(() {
         _usageData = const [];
-        _errorMessage = 'Unable to read usage data. Please try again.';
       });
     } finally {
       if (mounted) {
@@ -383,101 +457,69 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     }
 
     final now = DateTime.now();
-    final activeEntries = _blockedEntries
-        .where((entry) => entry.blockedUntil.isAfter(now))
-        .toList();
-
-    final start =
-        _lastEventPollTime ?? now.subtract(const Duration(minutes: 2));
+    _lastEventPollTime ??= now.subtract(const Duration(minutes: 2));
+    final start = _lastEventPollTime!;
     final end = now;
     _lastEventPollTime = end;
 
     try {
       final events = await UsageStats.queryEvents(start, end);
-      if (!mounted) {
-        return;
-      }
+      debugPrint(
+        '[EventMonitor] Polled ${events.length} events from $start to $end',
+      );
 
-      if (activeEntries.isNotEmpty) {
-        setState(() {
-          _blockedEntries.removeWhere(
-            (entry) => entry.blockedUntil.isBefore(now),
-          );
-        });
+      // Build a merged list of all blocked apps
+      final Map<String, String> blockedApps = {};
 
-        for (final entry in activeEntries) {
-          if (entry.blockedUntil.isBefore(now)) {
-            continue;
-          }
-          if (entry.lastPromptTime != null &&
-              now.difference(entry.lastPromptTime!).inSeconds < 30) {
-            continue;
-          }
-          final wasOpened = events.any(
-            (event) => event.packageName == entry.packageName,
-          );
-          if (wasOpened) {
-            entry.lastPromptTime = now;
-            await _handleBlockedAttempt(entry);
-            if (!mounted) {
-              return;
-            }
-          }
+      // Add stake blocks
+      for (final e in _blockedEntries) {
+        if (e.blockedUntil.isAfter(now)) {
+          blockedApps[e.packageName] = e.appName;
         }
       }
+
+      // Add daily limit blocks
+      _dailyLimits.forEach((pkg, entry) {
+        if (entry.isBlocked) {
+          blockedApps[pkg] = entry.appName;
+        }
+      });
+
+      debugPrint('[BlockedApps] Currently blocked apps: $blockedApps');
+
+      // Detect if a blocked app was opened
+      for (final event in events) {
+        final type = event.eventType?.toString() ?? '';
+        final pkg = event.packageName ?? '';
+
+        final isForegroundEvent =
+            type == '1' ||
+            type == 'MOVE_TO_FOREGROUND' ||
+            type == 'ACTIVITY_RESUMED';
+        if (isForegroundEvent && blockedApps.containsKey(pkg)) {
+          final appName = blockedApps[pkg];
+          debugPrint(
+            '[BlockDetect] Blocked app opened: $appName ($pkg) | type=$type',
+          );
+
+          // Action when blocked app is opened
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('$appName is blocked! Touch grass 🌿')),
+          );
+
+          // Optional: bring this app (touch_grass) back to foreground
+          await _bringAppToFront();
+
+          // Optional: short delay to avoid multiple triggers
+          await Future.delayed(const Duration(seconds: 2));
+        }
+      }
+
       await _checkDailyLimits(now);
     } catch (error, stackTrace) {
-      debugPrint('Failed to monitor blocked apps: $error');
+      debugPrint('[EventMonitor] Failed to monitor blocked apps: $error');
       debugPrint('$stackTrace');
     }
-  }
-
-  Future<void> _handleBlockedAttempt(BlockedAppEntry entry) async {
-    if (!mounted) {
-      return;
-    }
-
-    final result = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) {
-        return AlertDialog(
-          title: Text('${entry.appName} is blocked'),
-          content: Text(
-            'You staked ${_formatCurrency(entry.stakeAmount)} to block this '
-            'app until ${_formatDateTime(entry.blockedUntil)}. '
-            'Opening it now will forfeit your stake. Continue?',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Continue'),
-            ),
-          ],
-        );
-      },
-    );
-
-    if (result == true) {
-      debugPrint('Stake lost: ${entry.stakeAmount} USD on ${entry.appName}');
-      setState(() {
-        _blockedEntries.remove(entry);
-      });
-      _stopEventMonitorIfIdle();
-    } else {
-      debugPrint('Stake preserved for ${entry.appName}');
-    }
-  }
-
-  void _removeBlock(BlockedAppEntry entry) {
-    setState(() {
-      _blockedEntries.remove(entry);
-    });
-    _stopEventMonitorIfIdle();
   }
 
   void _resetDailyLimitsIfNeeded() {
@@ -823,7 +865,34 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Widget _buildUsageContent() {
-    return const SizedBox.shrink();
+    if (!_hasPermission) {
+      return _PermissionBanner(onGrantPermission: _openUsageSettings);
+    }
+
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_usageData.isEmpty) {
+      return const Center(
+        child: Text('No usage data available for the selected range.'),
+      );
+    }
+
+    return ListView.separated(
+      itemCount: _usageData.length,
+      separatorBuilder: (_, __) => const Divider(),
+      itemBuilder: (context, index) {
+        final usage = _usageData[index];
+        return ListTile(
+          leading: usage.icon != null
+              ? CircleAvatar(backgroundImage: MemoryImage(usage.icon!))
+              : const CircleAvatar(child: Icon(Icons.apps)),
+          title: Text(usage.appName ?? usage.packageName),
+          subtitle: Text('Usage: ${_formatDuration(usage.totalTime)}'),
+        );
+      },
+    );
   }
 
   List<BlockedAppEntry> _activeBlocks() {
@@ -892,7 +961,12 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
               for (final entry in activeBlocks)
                 _ActiveBlockTile(
                   entry: entry,
-                  onRemove: () => _removeBlock(entry),
+                  onRemove: () {
+                    setState(() {
+                      _blockedEntries.remove(entry);
+                    });
+                    _stopEventMonitorIfIdle();
+                  },
                 ),
             ],
           ],
@@ -932,6 +1006,10 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
               child: const Text('1 more minute pleaseeee!!'),
             ),
             const SizedBox(height: 12),
+            IconButton(
+              icon: const Icon(Icons.bug_report),
+              onPressed: _checkBlockedViolations,
+            ),
             if (entries.isEmpty)
               const Text('No daily limits yet.')
             else ...[
