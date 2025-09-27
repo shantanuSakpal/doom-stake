@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -149,11 +150,19 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       final body = await response.stream.bytesToString();
 
       if (response.statusCode >= 200 && response.statusCode < 300) {
-        debugPrint('Image upload successful: $body');
-        return true;
+        /**Image upload successful: {"fileUrl":"https://harlequin-fast-jay-552.mypinata.cloud/ipfs/bafkreictppz3hrmkza7y4curbfk7psrzw2gbpwxvyzswwx3worqvgtx524","modelResponse":false} */
+        final json = jsonDecode(body);
+        final fileUrl = json['fileUrl'];
+        debugPrint('File URL: $fileUrl');
+        final modelResponse = json['modelResponse'];
+        debugPrint('Model response: $modelResponse');
+        if (modelResponse) {
+          debugPrint('Model response is true');
+          return true;
+        }
+        debugPrint('Model response is false or image upload failed');
+        return false;
       }
-
-      debugPrint('Image upload failed: ${response.statusCode} -> $body');
     } catch (error, stackTrace) {
       debugPrint('Image upload error: $error');
       debugPrint('$stackTrace');
