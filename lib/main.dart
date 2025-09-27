@@ -611,9 +611,9 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
     try {
       final events = await UsageStats.queryEvents(start, end);
-      debugPrint(
-        '[EventMonitor] Polled ${events.length} events from $start to $end',
-      );
+      // debugPrint(
+      //   '[EventMonitor] Polled ${events.length} events from $start to $end',
+      // );
 
       // Build a merged list of all blocked apps
       final Map<String, String> blockedApps = {};
@@ -632,7 +632,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         }
       });
 
-      debugPrint('[BlockedApps] Currently blocked apps: $blockedApps');
+      // debugPrint('[BlockedApps] Currently blocked apps: $blockedApps');
 
       // Detect if a blocked app was opened
       for (final event in events) {
@@ -842,7 +842,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    const Text('Stake USD to block apps for a set duration.'),
+                    const Text('Stake FLOW to block apps for a set duration.'),
                     const SizedBox(height: 12),
                     TextField(
                       controller: durationController,
@@ -858,7 +858,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                         decimal: true,
                       ),
                       decoration: const InputDecoration(
-                        labelText: 'Stake amount (USD)',
+                        labelText: 'Stake amount (FLOW)',
                       ),
                     ),
                     const SizedBox(height: 12),
@@ -959,7 +959,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                     Navigator.of(context).pop(
                       _StakeRequest(
                         duration: Duration(minutes: durationMinutes),
-                        amountUsd: amount,
+                        amountFLOW: amount,
                         selectedApps: chosenApps,
                       ),
                     );
@@ -983,13 +983,90 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     _handleStakeRequest(request);
   }
 
-  void _handleStakeRequest(_StakeRequest request) {
+  static const String _stakeAbi = '''
+[
+  {"inputs":[{"internalType":"uint256","name":"_stakeTime","type":"uint256"}],
+   "name":"stake",
+   "outputs":[],
+   "stateMutability":"payable",
+   "type":"function"}
+]
+''';
+
+  static final EthereumAddress _stakeContract = EthereumAddress.fromHex(
+    "0xa861f9c3CD9EcBB01ad0aCf0B43a606C4C87269F",
+  );
+
+  Future<String> _sendStake(double amountFlow, int stakeTimeSeconds) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final privateKey = prefs.getString('privateKey');
+
+      if (privateKey == null || privateKey.isEmpty) {
+        throw Exception("No private key found. Please login first.");
+      }
+
+      final client = Web3Client(
+        "https://testnet.evm.nodes.onflow.org", // Flow EVM testnet RPC
+        Client(),
+      );
+
+      final credentials = EthPrivateKey.fromHex(privateKey);
+
+      final contract = DeployedContract(
+        ContractAbi.fromJson(_stakeAbi, "StakeContract"),
+        _stakeContract,
+      );
+
+      final stakeFunction = contract.function("stake");
+
+      final value = EtherAmount.fromUnitAndValue(
+        EtherUnit.wei,
+        BigInt.from(amountFlow * 1e18), // convert double to BigInt
+      );
+
+      final txHash = await client.sendTransaction(
+        credentials,
+        Transaction.callContract(
+          contract: contract,
+          function: stakeFunction,
+          parameters: [BigInt.from(stakeTimeSeconds)], // _stakeTime
+          value: value, // sending FLOW
+        ),
+        chainId: 545, // Flow EVM testnet
+      );
+
+      setState(() {
+        _lastTxHash = txHash;
+      });
+
+      return txHash;
+    } catch (e) {
+      debugPrint("Stake error: $e");
+      return "Error: $e";
+    }
+  }
+
+  void _handleStakeRequest(_StakeRequest request) async {
     final blockedUntil = DateTime.now().add(request.duration);
     final appNames = request.selectedApps.map((app) => app.name).join(', ');
+
     debugPrint(
-      'Stake function called: amount=${request.amountUsd} USD, '
+      'Calling stake: amount=${request.amountFLOW} FLOW, '
       'duration=${request.duration.inMinutes} minutes, apps=[$appNames]',
     );
+
+    // send real tx
+    final txHash = await _sendStake(
+      request.amountFLOW, // FLOW amount
+      request.duration.inSeconds, // pass seconds as stakeTime
+    );
+
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Stake tx sent: $txHash")));
+    }
 
     setState(() {
       for (final app in request.selectedApps) {
@@ -1001,7 +1078,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             packageName: app.packageName,
             appName: app.name,
             blockedUntil: blockedUntil,
-            stakeAmount: request.amountUsd,
+            stakeAmount: request.amountFLOW,
             icon: app.icon,
           ),
         );
@@ -1086,7 +1163,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             ),
             const SizedBox(height: 8),
             Text(
-              'Stake USD to block distracting apps for a custom time period.',
+              'Stake FLOW to block distracting apps for a custom time period.',
               style: Theme.of(context).textTheme.bodyMedium,
             ),
             const SizedBox(height: 12),
@@ -1720,12 +1797,12 @@ class BlockedAppEntry {
 class _StakeRequest {
   const _StakeRequest({
     required this.duration,
-    required this.amountUsd,
+    required this.amountFLOW,
     required this.selectedApps,
   });
 
   final Duration duration;
-  final double amountUsd;
+  final double amountFLOW;
   final List<AppInfo> selectedApps;
 }
 
