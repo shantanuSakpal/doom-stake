@@ -7,6 +7,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:installed_apps/app_info.dart';
 import 'package:installed_apps/installed_apps.dart';
 import 'package:usage_stats/usage_stats.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const ScreenTimeApp());
@@ -108,6 +109,8 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         return;
       }
 
+      final uploadSucceeded = await _uploadPhoto(photo);
+
       setState(() {
         for (final entry in blockedEntries) {
           entry.extendLimit(const Duration(minutes: 1));
@@ -119,11 +122,13 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Grass touched! Limits extended by 1 minutes.'),
-        ),
-      );
+
+      final message = uploadSucceeded
+          ? 'Grass touched! Limits extended by 1 minute. Image uploaded.'
+          : 'Grass touched! Limits extended by 1 minute. Image upload failed.';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     } catch (error) {
       if (!mounted) {
         return;
@@ -132,6 +137,28 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         SnackBar(content: Text('Failed to access camera: $error')),
       );
     }
+  }
+
+  Future<bool> _uploadPhoto(XFile photo) async {
+    final uri = Uri.parse('https://bab5e820daa4.ngrok-free.app/upload-image');
+    try {
+      final request = http.MultipartRequest('POST', uri)
+        ..files.add(await http.MultipartFile.fromPath('image', photo.path));
+
+      final response = await request.send();
+      final body = await response.stream.bytesToString();
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        debugPrint('Image upload successful: $body');
+        return true;
+      }
+
+      debugPrint('Image upload failed: ${response.statusCode} -> $body');
+    } catch (error, stackTrace) {
+      debugPrint('Image upload error: $error');
+      debugPrint('$stackTrace');
+    }
+    return false;
   }
 
   @override
