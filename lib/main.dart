@@ -52,7 +52,7 @@ class ScreenTimeApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Doom Stake',
+      title: 'Touch Grass',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
@@ -1111,7 +1111,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   Widget build(BuildContext context) {
     if (!_isAndroid) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Doom Stake')),
+        appBar: AppBar(title: const Text('Touch Grass')),
         body: const Center(
           child: Padding(
             padding: EdgeInsets.all(24),
@@ -1126,7 +1126,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Doom Stake'),
+        title: const Text('Touch Grass'),
         actions: [
           IconButton(
             onPressed: _isLoading || !_hasPermission
