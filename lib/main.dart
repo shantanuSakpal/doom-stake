@@ -23,6 +23,7 @@ import 'package:http/http.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 @pragma("vm:entry-point")
 void overlayMain() {
@@ -65,7 +66,7 @@ class ScreenTimeApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Touch Grass',
+      title: 'Doom Stake',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
@@ -100,6 +101,21 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   bool _isLoggedIn = false;
   String _address = '';
   final String _rpcUrl = 'https://1rpc.io/sepolia';
+
+  String _shortHash(String h, {int head = 10, int tail = 8}) {
+    if (h.length <= head + tail) return h;
+    return '${h.substring(0, head)}…${h.substring(h.length - tail)}';
+  }
+
+  Future<void> _openTxOnFlowscan(String hash) async {
+    final uri = Uri.parse('https://evm-testnet.flowscan.io/tx/$hash');
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Could not open FlowScan.')));
+    }
+  }
 
   Future<void> _loginWithEmailPasswordless(String email) async {
     try {
@@ -164,16 +180,16 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
           from: senderAddress,
           to: EthereumAddress.fromHex(
             "0xFe53F81e87379e6730C0a2E0Afab0B7e011b1C55",
-          ), // 👈 replace with target
+          ),
           value: EtherAmount.fromUnitAndValue(EtherUnit.ether, 1), // 1 FLOW
         ),
-        chainId: 545, // Flow EVM Testnet
+        chainId: 545,
       );
 
       debugPrint("Transaction hash: $txHash");
 
       setState(() {
-        _address = "Tx sent: $txHash";
+        _lastTxHash = txHash;
       });
 
       return txHash;
@@ -1133,13 +1149,13 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     } else {
       return Card(
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.symmetric(horizontal: 10),
           child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(
-                mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Flexible(
+                  Expanded(
                     child: Text(
                       "Logged in as: $_address",
                       overflow: TextOverflow.ellipsis,
@@ -1157,12 +1173,31 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
-              ElevatedButton(onPressed: _logout, child: const Text("Logout")),
-              ElevatedButton(
-                onPressed: _sendFlowToken,
-                child: const Text("Send 1 FLOW (Testnet)"),
-              ),
+
+              if (_lastTxHash != null) ...[
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Tx: ${_shortHash(_lastTxHash!)}',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: () => _openTxOnFlowscan(_lastTxHash!),
+                      icon: const Icon(Icons.open_in_new),
+                      label: const Text('View'),
+                    ),
+                  ],
+                ),
+              ],
+
+              // const SizedBox(height: 8),
+              // ElevatedButton(
+              //   onPressed: _sendFlowToken,
+              //   child: const Text("Send 1 FLOW (Testnet)"),
+              // ),
             ],
           ),
         ),
@@ -1180,10 +1215,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(
-              'Stop the doom',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
+            Text('Touch Grass', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(
               'Set a 1-minute limit for apps. Once crossed, the app is blocked for the day. To unlock, touch grass, literally!',
@@ -1302,7 +1334,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   Widget build(BuildContext context) {
     if (!_isAndroid) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Touch Grass')),
+        appBar: AppBar(title: const Text('Doom Stake')),
         body: const Center(
           child: Padding(
             padding: EdgeInsets.all(24),
@@ -1317,7 +1349,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Touch Grass'),
+        title: const Text('Doom Stake'),
         actions: [
           IconButton(
             onPressed: _isLoading || !_hasPermission
@@ -1326,6 +1358,13 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh stats',
           ),
+          if (_isLoggedIn) // show logout only when logged in
+            IconButton(
+              onPressed: _logout,
+              icon: const Icon(Icons.logout, color: Colors.red),
+              tooltip: 'Logout',
+            ),
+
           // IconButton(
           //   onPressed: _selectDateRange,
           //   icon: const Icon(Icons.calendar_today),
@@ -1335,16 +1374,20 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _buildWeb3AuthPanel(),
-            _buildStakePanel(),
-            const SizedBox(height: 16),
-            _buildLimitsPanel(),
-            const SizedBox(height: 16),
-            Expanded(child: _buildUsageContent()),
-          ],
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildWeb3AuthPanel(),
+              const SizedBox(height: 16),
+              _buildStakePanel(),
+              const SizedBox(height: 16),
+              _buildLimitsPanel(),
+              const SizedBox(height: 16),
+              // Make usage stats shrink-wrap instead of Expanded
+              // _buildUsageContent(),
+            ],
+          ),
         ),
       ),
     );
@@ -1773,6 +1816,8 @@ String _formatDateTime(DateTime date) {
   final period = date.hour >= 12 ? 'PM' : 'AM';
   return '${_formatDate(date)} $hour12:$minute $period';
 }
+
+String? _lastTxHash;
 
 bool _isSameDay(DateTime a, DateTime b) {
   return a.year == b.year && a.month == b.month && a.day == b.day;
