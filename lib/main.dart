@@ -264,7 +264,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<void> _bringAppToFront() async {
-    const packageName = 'com.example.touch_grass';
+    const packageName = 'com.example.touchgrass';
     debugPrint('[BringAppToFront] Trying to launch $packageName');
 
     try {
