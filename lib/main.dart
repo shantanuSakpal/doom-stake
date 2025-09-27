@@ -22,6 +22,7 @@ import 'package:web3dart/web3dart.dart';
 import 'package:http/http.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter/services.dart';
 
 @pragma("vm:entry-point")
 void overlayMain() {
@@ -135,6 +136,50 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       });
     } catch (e) {
       debugPrint("Logout failed: $e");
+    }
+  }
+
+  Future<String> _sendFlowToken() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final privateKey = prefs.getString('privateKey');
+
+      if (privateKey == null || privateKey.isEmpty) {
+        throw Exception("No private key found. Please login first.");
+      }
+
+      final client = Web3Client(
+        "https://testnet.evm.nodes.onflow.org", // Flow EVM testnet RPC
+        Client(),
+      );
+
+      final credentials = EthPrivateKey.fromHex(privateKey);
+      final senderAddress = await credentials.extractAddress();
+
+      debugPrint("Sender: $senderAddress");
+
+      final txHash = await client.sendTransaction(
+        credentials,
+        Transaction(
+          from: senderAddress,
+          to: EthereumAddress.fromHex(
+            "0xFe53F81e87379e6730C0a2E0Afab0B7e011b1C55",
+          ), // 👈 replace with target
+          value: EtherAmount.fromUnitAndValue(EtherUnit.ether, 1), // 1 FLOW
+        ),
+        chainId: 545, // Flow EVM Testnet
+      );
+
+      debugPrint("Transaction hash: $txHash");
+
+      setState(() {
+        _address = "Tx sent: $txHash";
+      });
+
+      return txHash;
+    } catch (e) {
+      debugPrint("Error sending Flow token: $e");
+      return "Error: $e";
     }
   }
 
@@ -1091,9 +1136,33 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
           padding: const EdgeInsets.all(16),
           child: Column(
             children: [
-              Text("Logged in as: $_address"),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Flexible(
+                    child: Text(
+                      "Logged in as: $_address",
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.copy, size: 18),
+                    tooltip: "Copy address",
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: _address));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text("Address copied!")),
+                      );
+                    },
+                  ),
+                ],
+              ),
               const SizedBox(height: 8),
               ElevatedButton(onPressed: _logout, child: const Text("Logout")),
+              ElevatedButton(
+                onPressed: _sendFlowToken,
+                child: const Text("Send 1 FLOW (Testnet)"),
+              ),
             ],
           ),
         ),
