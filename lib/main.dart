@@ -110,26 +110,57 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         return;
       }
 
-      final uploadSucceeded = await _uploadPhoto(photo);
+      var loaderVisible = false;
+      _UploadResult uploadResult = const _UploadResult(uploaded: false);
 
-      setState(() {
-        for (final entry in blockedEntries) {
-          entry.extendLimit(const Duration(minutes: 1));
+      if (mounted) {
+        loaderVisible = true;
+        _showBlockingLoader('Analyzing your photo...');
+      }
+
+      try {
+        uploadResult = await _uploadPhoto(photo);
+      } finally {
+        if (loaderVisible && mounted) {
+          Navigator.of(context, rootNavigator: true).pop();
         }
-      });
-
-      await _checkDailyLimits(DateTime.now());
+      }
 
       if (!mounted) {
         return;
       }
 
-      final message = uploadSucceeded
-          ? 'Grass touched! Limits extended by 1 minute. Image uploaded.'
-          : 'Grass touched! Limits extended by 1 minute. Image upload failed.';
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
+      if (uploadResult.approved) {
+        setState(() {
+          for (final entry in blockedEntries) {
+            entry.extendLimit(const Duration(minutes: 1));
+          }
+        });
+
+        await _checkDailyLimits(DateTime.now());
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Good job, fresh air feels nice dosen\'t it?. Limits extended by 1 minute.',
+            ),
+          ),
+        );
+      } else if (uploadResult.uploaded && uploadResult.modelApproved == false) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Get your butt out bro. You still need to touch grass.',
+            ),
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not verify your photo. Please try again.'),
+          ),
+        );
+      }
     } catch (error) {
       if (!mounted) {
         return;
@@ -140,7 +171,15 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     }
   }
 
-  Future<bool> _uploadPhoto(XFile photo) async {
+  void _showBlockingLoader(String message) {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => _LoadingDialog(message: message),
+    );
+  }
+
+  Future<_UploadResult> _uploadPhoto(XFile photo) async {
     final uri = Uri.parse('https://bab5e820daa4.ngrok-free.app/upload-image');
     try {
       final request = http.MultipartRequest('POST', uri)
@@ -150,24 +189,36 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       final body = await response.stream.bytesToString();
 
       if (response.statusCode >= 200 && response.statusCode < 300) {
-        /**Image upload successful: {"fileUrl":"https://harlequin-fast-jay-552.mypinata.cloud/ipfs/bafkreictppz3hrmkza7y4curbfk7psrzw2gbpwxvyzswwx3worqvgtx524","modelResponse":false} */
-        final json = jsonDecode(body);
-        final fileUrl = json['fileUrl'];
-        debugPrint('File URL: $fileUrl');
-        final modelResponse = json['modelResponse'];
-        debugPrint('Model response: $modelResponse');
-        if (modelResponse) {
-          debugPrint('Model response is true');
-          return true;
+        debugPrint('Image upload successful: $body');
+
+        bool? modelApproved;
+        try {
+          final decoded = jsonDecode(body);
+          if (decoded is Map<String, dynamic>) {
+            final fileUrl = decoded['fileUrl'];
+            if (fileUrl != null) {
+              debugPrint('File URL: $fileUrl');
+            }
+            final modelResponse = decoded['modelResponse'];
+            if (modelResponse is bool) {
+              modelApproved = modelResponse;
+            } else if (modelResponse is String) {
+              modelApproved = modelResponse.toLowerCase() == 'true';
+            }
+          }
+        } catch (error) {
+          debugPrint('Failed to parse upload response: $error');
         }
-        debugPrint('Model response is false or image upload failed');
-        return false;
+
+        return _UploadResult(uploaded: true, modelApproved: modelApproved);
       }
+
+      debugPrint('Image upload failed: ${response.statusCode} -> $body');
     } catch (error, stackTrace) {
       debugPrint('Image upload error: $error');
       debugPrint('$stackTrace');
     }
-    return false;
+    return const _UploadResult(uploaded: false);
   }
 
   @override
@@ -1161,6 +1212,43 @@ class _AppSelectionSheet extends StatefulWidget {
 
   @override
   State<_AppSelectionSheet> createState() => _AppSelectionSheetState();
+}
+
+class _UploadResult {
+  const _UploadResult({required this.uploaded, this.modelApproved});
+
+  final bool uploaded;
+  final bool? modelApproved;
+
+  bool get approved => uploaded && (modelApproved ?? false);
+}
+
+class _LoadingDialog extends StatelessWidget {
+  const _LoadingDialog({required this.message, super.key});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 24),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _AppSelectionSheetState extends State<_AppSelectionSheet> {
