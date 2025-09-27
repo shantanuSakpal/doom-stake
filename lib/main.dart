@@ -1131,11 +1131,11 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh stats',
           ),
-          IconButton(
-            onPressed: _selectDateRange,
-            icon: const Icon(Icons.calendar_today),
-            tooltip: 'Select date range',
-          ),
+          // IconButton(
+          //   onPressed: _selectDateRange,
+          //   icon: const Icon(Icons.calendar_today),
+          //   tooltip: 'Select date range',
+          // ),
         ],
       ),
       body: Padding(
