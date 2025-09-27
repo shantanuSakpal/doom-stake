@@ -1006,10 +1006,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
               child: const Text('1 more minute pleaseeee!!'),
             ),
             const SizedBox(height: 12),
-            IconButton(
-              icon: const Icon(Icons.bug_report),
-              onPressed: _checkBlockedViolations,
-            ),
             if (entries.isEmpty)
               const Text('No daily limits yet.')
             else ...[
