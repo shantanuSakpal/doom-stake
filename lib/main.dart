@@ -87,6 +87,8 @@ class ScreenTimeHomePage extends StatefulWidget {
 class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     with WidgetsBindingObserver {
   bool _isLoading = false;
+  final TextEditingController _emailController = TextEditingController();
+
   bool _hasPermission = false;
   late DateTime _startDate;
   late DateTime _endDate;
@@ -105,6 +107,44 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   Timer? _balanceRefreshTimer;
   double? _totalStaked;
   double? _currentReward;
+  Future<void> _checkLoginStatus() async {
+    debugPrint("Checking login status…");
+
+    try {
+      // First, try restoring via Web3Auth
+      final privKey = await Web3AuthFlutter.getPrivKey();
+
+      if (privKey != null && privKey.isNotEmpty) {
+        final creds = EthPrivateKey.fromHex(privKey);
+        final addr = creds.address.hexEip55;
+
+        setState(() {
+          _isLoggedIn = true;
+          _address = addr;
+        });
+
+        // Save it locally too, in case you want quick access
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('privateKey', privKey);
+
+        await _refreshAllStats();
+
+        _balanceRefreshTimer?.cancel();
+        _balanceRefreshTimer = Timer.periodic(
+          const Duration(seconds: 5),
+          (_) => _refreshAllStats(),
+        );
+      } else {
+        debugPrint("No Web3Auth session found.");
+      }
+    } catch (e) {
+      debugPrint("Failed to restore session: $e");
+    }
+  }
+
+  Future<void> _refreshAllStats() async {
+    await Future.wait([_loadBalance(), _loadStakeStats()]);
+  }
 
   Future<String> _withdrawStake() async {
     try {
@@ -149,6 +189,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<void> _loadStakeStats() async {
+    debugPrint("Loading stake stats...");
     try {
       final client = Web3Client(
         "https://testnet.evm.nodes.onflow.org",
@@ -189,6 +230,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<void> _loadBalance() async {
+    debugPrint("Loading balance...");
     try {
       final prefs = await SharedPreferences.getInstance();
       final privateKey = prefs.getString('privateKey');
@@ -248,13 +290,14 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         _isLoggedIn = true;
         _address = addr;
       });
-      await _loadBalance();
+
+      await _refreshAllStats();
 
       // Start auto refresh every 5s
       _balanceRefreshTimer?.cancel();
       _balanceRefreshTimer = Timer.periodic(
         const Duration(seconds: 5),
-        (_) => _loadBalance(),
+        (_) => _refreshAllStats(),
       );
     } catch (e) {
       debugPrint("Login failed: $e");
@@ -373,6 +416,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
     _initUsageAccess();
     _initWeb3Auth();
+    _checkLoginStatus();
   }
 
   Future<void> _handleTouchGrassRequest() async {
@@ -574,6 +618,8 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
   @override
   void dispose() {
+    _emailController.dispose();
+
     WidgetsBinding.instance.removeObserver(this);
     _usageRefreshTimer?.cancel();
     _eventMonitorTimer?.cancel();
@@ -1223,7 +1269,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     final appNames = request.selectedApps.map((app) => app.name).join(', ');
 
     // caluclate the num of blocks to stake considering 0.8 seconds per block
-    final numBlocks = (request.duration.inSeconds / 0.8).ceil();
+    final numBlocks = (request.duration.inSeconds / 1).ceil();
     // send real tx
     debugPrint(
       'Calling stake: amount=${request.amountFLOW} FLOW, '
@@ -1319,6 +1365,46 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     return active;
   }
 
+  Widget _buildWithdrawPanel() {
+    if (!_isLoggedIn) return const SizedBox.shrink();
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Withdraw & Stats',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: () async {
+                final tx = await _withdrawStake();
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text("Withdraw tx sent: $tx")),
+                );
+                await _loadBalance();
+                await _loadStakeStats();
+              },
+              icon: const Icon(Icons.download),
+              label: const Text("Withdraw Stake"),
+            ),
+            const SizedBox(height: 12),
+            if (_totalStaked != null && _currentReward != null)
+              Text(
+                "TVL: ${_totalStaked?.toStringAsFixed(2)} FLOW • "
+                "Current Reward Pool: ${_currentReward?.toStringAsFixed(2)} FLOW",
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildStakePanel() {
     final activeBlocks = _activeBlocks();
     final rangeLabel = '${_formatDate(_startDate)} - ${_formatDate(_endDate)}';
@@ -1329,29 +1415,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            if (_isLoggedIn) ...[
-              const SizedBox(height: 8),
-              FilledButton.icon(
-                onPressed: () async {
-                  final tx = await _withdrawStake();
-                  if (!mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text("Withdraw tx sent: $tx")),
-                  );
-                  await _loadBalance();
-                  await _loadStakeStats();
-                },
-                icon: const Icon(Icons.download),
-                label: const Text("Withdraw Stake"),
-              ),
-              const SizedBox(height: 12),
-              if (_totalStaked != null && _currentReward != null)
-                Text(
-                  "TVL: $_totalStaked FLOW • Current Reward Pool: $_currentReward FLOW",
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-            ],
-
             Text(
               'Stake & Block',
               style: Theme.of(context).textTheme.titleMedium,
@@ -1395,8 +1458,6 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Widget _buildWeb3AuthPanel() {
-    final emailController = TextEditingController();
-
     if (!_isLoggedIn) {
       return Card(
         child: Padding(
@@ -1405,13 +1466,13 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             children: [
               const Text("Login with Web3Auth"),
               TextField(
-                controller: emailController,
+                controller: _emailController,
                 decoration: const InputDecoration(labelText: "Enter Email"),
               ),
               const SizedBox(height: 8),
               ElevatedButton(
                 onPressed: () {
-                  final email = emailController.text.trim();
+                  final email = _emailController.text.trim();
                   if (email.isEmpty) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(content: Text("Please enter your email")),
@@ -1675,6 +1736,8 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             children: [
               _buildWeb3AuthPanel(),
               const SizedBox(height: 16),
+              _buildWithdrawPanel(),
+              const SizedBox(height: 16),
               _buildStakePanel(),
               const SizedBox(height: 16),
               _buildLimitsPanel(),
@@ -1771,11 +1834,11 @@ class _ActiveBlockTile extends StatelessWidget {
         'Stake ${_formatCurrency(entry.stakeAmount)}',
       ),
 
-      trailing: IconButton(
-        icon: const Icon(Icons.close),
-        onPressed: onRemove,
-        tooltip: 'Remove block',
-      ),
+      // trailing: IconButton(
+      //   icon: const Icon(Icons.close),
+      //   onPressed: onRemove,
+      //   tooltip: 'Remove block',
+      // ),
     );
   }
 }
