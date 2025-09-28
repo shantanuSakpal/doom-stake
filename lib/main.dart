@@ -107,6 +107,10 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   Timer? _balanceRefreshTimer;
   double? _totalStaked;
   double? _currentReward;
+  double? _userStakedAmount;
+  DateTime? _userStakeTimestamp;
+  bool? _userStakeActive;
+
   Future<void> _checkLoginStatus() async {
     debugPrint("Checking login status…");
 
@@ -143,7 +147,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<void> _refreshAllStats() async {
-    await Future.wait([_loadBalance(), _loadStakeStats()]);
+    await Future.wait([_loadBalance(), _loadStakeStats(), _loadUserStake()]);
   }
 
   Future<String> _withdrawStake() async {
@@ -188,8 +192,54 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     }
   }
 
+  Future<void> _loadUserStake() async {
+    // debugPrint("Loading user stake...");
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final privateKey = prefs.getString('privateKey');
+      if (privateKey == null || privateKey.isEmpty) return;
+
+      final client = Web3Client(
+        "https://testnet.evm.nodes.onflow.org",
+        Client(),
+      );
+
+      final credentials = EthPrivateKey.fromHex(privateKey);
+      final userAddress = await credentials.extractAddress();
+
+      final contract = DeployedContract(
+        ContractAbi.fromJson(_stakeAbi, "StakeContract"),
+        _stakeContract,
+      );
+
+      final stakesFn = contract.function("stakes");
+
+      final result = await client.call(
+        contract: contract,
+        function: stakesFn,
+        params: [userAddress],
+      );
+
+      final BigInt amount = result[0] as BigInt;
+      final BigInt timestamp = result[1] as BigInt;
+      final bool active = result[2] as bool;
+      // debugPrint("User staked amount: $amount");
+      // debugPrint("User stake timestamp: $timestamp");
+      // debugPrint("User stake active: $active");
+      setState(() {
+        _userStakedAmount = amount / BigInt.from(1e18); // convert to FLOW
+        _userStakeTimestamp = DateTime.fromMillisecondsSinceEpoch(
+          timestamp.toInt() * 1000,
+        );
+        _userStakeActive = active;
+      });
+    } catch (e) {
+      debugPrint("Error loading user stake: $e");
+    }
+  }
+
   Future<void> _loadStakeStats() async {
-    debugPrint("Loading stake stats...");
+    // debugPrint("Loading stake stats...");
     try {
       final client = Web3Client(
         "https://testnet.evm.nodes.onflow.org",
@@ -230,7 +280,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<void> _loadBalance() async {
-    debugPrint("Loading balance...");
+    // debugPrint("Loading balance...");
     try {
       final prefs = await SharedPreferences.getInstance();
       final privateKey = prefs.getString('privateKey');
@@ -771,6 +821,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<void> _callSlashApi(String appName, String address) async {
+    debugPrint("Calling slash API...");
     try {
       final baseUrl = dotenv.env['NGROK_BASE_URL'] ?? '';
       if (baseUrl.isEmpty) {
@@ -1188,8 +1239,8 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       },
     );
 
-    durationController.dispose();
-    amountController.dispose();
+    // durationController.dispose();
+    // amountController.dispose();
 
     if (request == null) {
       return;
@@ -1200,13 +1251,45 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
 
   static const String _stakeAbi = '''
 [
-  {"inputs":[{"internalType":"uint256","name":"_stakeTime","type":"uint256"}],
-   "name":"stake","outputs":[],"stateMutability":"payable","type":"function"},
-  {"inputs":[],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},
-  {"inputs":[],"name":"totalStaked","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],
-   "stateMutability":"view","type":"function"},
-  {"inputs":[],"name":"currentReward","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],
-   "stateMutability":"view","type":"function"}
+  {
+    "inputs":[{"internalType":"uint256","name":"_stakeTime","type":"uint256"}],
+    "name":"stake",
+    "outputs":[],
+    "stateMutability":"payable",
+    "type":"function"
+  },
+  {
+    "inputs":[],
+    "name":"withdraw",
+    "outputs":[],
+    "stateMutability":"nonpayable",
+    "type":"function"
+  },
+  {
+    "inputs":[],
+    "name":"totalStaked",
+    "outputs":[{"internalType":"uint256","name":"","type":"uint256"}],
+    "stateMutability":"view",
+    "type":"function"
+  },
+  {
+    "inputs":[],
+    "name":"currentReward",
+    "outputs":[{"internalType":"uint256","name":"","type":"uint256"}],
+    "stateMutability":"view",
+    "type":"function"
+  },
+  {
+    "inputs":[{"internalType":"address","name":"user","type":"address"}],
+    "name":"stakes",
+    "outputs":[
+      {"internalType":"uint256","name":"amount","type":"uint256"},
+      {"internalType":"uint256","name":"timestamp","type":"uint256"},
+      {"internalType":"bool","name":"active","type":"bool"}
+    ],
+    "stateMutability":"view",
+    "type":"function"
+  }
 ]
 ''';
 
@@ -1386,19 +1469,27 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(content: Text("Withdraw tx sent: $tx")),
                 );
-                await _loadBalance();
-                await _loadStakeStats();
+                await _refreshAllStats();
               },
               icon: const Icon(Icons.download),
               label: const Text("Withdraw Stake"),
             ),
             const SizedBox(height: 12),
-            if (_totalStaked != null && _currentReward != null)
+
+            if (_totalStaked != null && _currentReward != null) ...[
+              Text("TVL: ${_totalStaked?.toStringAsFixed(2)} FLOW"),
               Text(
-                "TVL: ${_totalStaked?.toStringAsFixed(2)} FLOW • "
                 "Current Reward Pool: ${_currentReward?.toStringAsFixed(2)} FLOW",
-                style: Theme.of(context).textTheme.bodyMedium,
               ),
+            ],
+
+            if (_userStakedAmount != null) ...[
+              const Divider(),
+              Text("Your Stake: ${_userStakedAmount?.toStringAsFixed(2)} FLOW"),
+              if (_userStakeTimestamp != null)
+                Text("Since: ${_userStakeTimestamp}"),
+              Text("Active: ${_userStakeActive == true ? "Yes" : "No"}"),
+            ],
           ],
         ),
       ),
@@ -1709,6 +1800,7 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
                     await _loadUsageStats();
                     await _loadBalance();
                     await _loadStakeStats();
+                    await _loadUserStake();
                   },
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh stats',
@@ -1862,11 +1954,11 @@ class _DailyLimitTile extends StatelessWidget {
             ? 'Blocked for today'
             : 'Time used: ${_formatDuration(entry.accumulated)}',
       ),
-      trailing: IconButton(
-        icon: const Icon(Icons.close),
-        tooltip: 'Remove limit',
-        onPressed: onRemove,
-      ),
+      // trailing: IconButton(
+      //   icon: const Icon(Icons.close),
+      //   tooltip: 'Remove limit',
+      //   onPressed: onRemove,
+      // ),
     );
   }
 }
