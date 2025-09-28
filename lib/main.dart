@@ -24,6 +24,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:collection/collection.dart';
 
 @pragma("vm:entry-point")
 void overlayMain() {
@@ -100,7 +101,118 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   // Web3Auth state
   bool _isLoggedIn = false;
   String _address = '';
-  final String _rpcUrl = 'https://1rpc.io/sepolia';
+  String? _balance; // user balance in FLOW
+  Timer? _balanceRefreshTimer;
+  double? _totalStaked;
+  double? _currentReward;
+
+  Future<String> _withdrawStake() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final privateKey = prefs.getString('privateKey');
+      if (privateKey == null || privateKey.isEmpty) {
+        throw Exception("No private key found. Please login first.");
+      }
+
+      final client = Web3Client(
+        "https://testnet.evm.nodes.onflow.org",
+        Client(),
+      );
+
+      final credentials = EthPrivateKey.fromHex(privateKey);
+      final contract = DeployedContract(
+        ContractAbi.fromJson(_stakeAbi, "StakeContract"),
+        _stakeContract,
+      );
+
+      final withdrawFn = contract.function("withdraw");
+
+      final txHash = await client.sendTransaction(
+        credentials,
+        Transaction.callContract(
+          contract: contract,
+          function: withdrawFn,
+          parameters: [],
+        ),
+        chainId: 545,
+      );
+
+      debugPrint("Withdraw tx hash: $txHash");
+      setState(() {
+        _lastTxHash = txHash;
+      });
+      return txHash;
+    } catch (e) {
+      debugPrint("Withdraw error: $e");
+      return "Error: $e";
+    }
+  }
+
+  Future<void> _loadStakeStats() async {
+    try {
+      final client = Web3Client(
+        "https://testnet.evm.nodes.onflow.org",
+        Client(),
+      );
+
+      final contract = DeployedContract(
+        ContractAbi.fromJson(_stakeAbi, "StakeContract"),
+        _stakeContract,
+      );
+
+      final totalStakedFn = contract.function("totalStaked");
+      final currentRewardFn = contract.function("currentReward");
+
+      final totalStakedResult = await client.call(
+        contract: contract,
+        function: totalStakedFn,
+        params: [],
+      );
+      final currentRewardResult = await client.call(
+        contract: contract,
+        function: currentRewardFn,
+        params: [],
+      );
+
+      final totalStaked =
+          (totalStakedResult.first as BigInt) / BigInt.from(1e18);
+      final currentReward =
+          (currentRewardResult.first as BigInt) / BigInt.from(1e18);
+
+      setState(() {
+        _totalStaked = totalStaked.toDouble();
+        _currentReward = currentReward.toDouble();
+      });
+    } catch (e) {
+      debugPrint("Error loading stake stats: $e");
+    }
+  }
+
+  Future<void> _loadBalance() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final privateKey = prefs.getString('privateKey');
+
+      if (privateKey == null || privateKey.isEmpty) return;
+
+      final client = Web3Client(
+        "https://testnet.evm.nodes.onflow.org", // Flow EVM testnet RPC
+        Client(),
+      );
+
+      final credentials = EthPrivateKey.fromHex(privateKey);
+      final addr = await credentials.extractAddress();
+
+      final balanceWei = await client.getBalance(addr);
+      final balanceEth = balanceWei.getValueInUnit(EtherUnit.ether);
+
+      setState(() {
+        _balance = balanceEth.toStringAsFixed(3); // round to 3 decimals
+      });
+    } catch (e) {
+      debugPrint("Failed to load balance: $e");
+    }
+  }
 
   String _shortHash(String h, {int head = 10, int tail = 8}) {
     if (h.length <= head + tail) return h;
@@ -136,6 +248,14 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         _isLoggedIn = true;
         _address = addr;
       });
+      await _loadBalance();
+
+      // Start auto refresh every 5s
+      _balanceRefreshTimer?.cancel();
+      _balanceRefreshTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => _loadBalance(),
+      );
     } catch (e) {
       debugPrint("Login failed: $e");
     }
@@ -150,6 +270,8 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         _isLoggedIn = false;
         _address = '';
       });
+      _balanceRefreshTimer?.cancel();
+      _balanceRefreshTimer = null;
     } catch (e) {
       debugPrint("Logout failed: $e");
     }
@@ -369,7 +491,12 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   }
 
   Future<_UploadResult> _uploadPhoto(XFile photo) async {
-    final uri = Uri.parse('https://6bc2a30c273e.ngrok-free.app/upload-image');
+    final baseUrl = dotenv.env['NGROK_BASE_URL'] ?? '';
+    if (baseUrl.isEmpty) {
+      throw Exception("NGROK_BASE_URL not set in .env");
+    }
+
+    final uri = Uri.parse("$baseUrl/upload-image");
     try {
       final request = http.MultipartRequest('POST', uri)
         ..files.add(await http.MultipartFile.fromPath('image', photo.path));
@@ -597,6 +724,31 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     }
   }
 
+  Future<void> _callSlashApi(String appName, String address) async {
+    try {
+      final baseUrl = dotenv.env['NGROK_BASE_URL'] ?? '';
+      if (baseUrl.isEmpty) {
+        throw Exception("NGROK_BASE_URL not set in .env");
+      }
+
+      final uri = Uri.parse("$baseUrl/slash?address=$address");
+      final response = await http.get(uri);
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        debugPrint("[Slash] Success: ${response.body}");
+      } else {
+        debugPrint(
+          "[Slash] Failed: ${response.statusCode} -> ${response.body}",
+        );
+      }
+
+      debugPrint("[Slash] Success: $appName $address");
+    } catch (e, st) {
+      debugPrint("[Slash] Error calling API: $e");
+      debugPrint("$st");
+    }
+  }
+
   Future<void> _checkBlockedViolations() async {
     if (!_hasPermission || (_blockedEntries.isEmpty && _dailyLimits.isEmpty)) {
       _stopEventMonitorIfIdle();
@@ -654,11 +806,28 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
             SnackBar(content: Text('$appName is blocked! Touch grass 🌿')),
           );
 
-          // Optional: bring this app (touch_grass) back to foreground
-          await _bringAppToFront();
+          final stakeEntry = _blockedEntries.firstWhereOrNull(
+            (e) => e.packageName == pkg,
+          );
 
-          // Optional: short delay to avoid multiple triggers
-          await Future.delayed(const Duration(seconds: 2));
+          if (stakeEntry != null) {
+            setState(() {
+              _blockedEntries.remove(stakeEntry);
+            });
+
+            await _callSlashApi(appName!, _address);
+
+            // Optional: bring this app (touch_grass) back to foreground
+            await _bringAppToFront();
+
+            // Optional: short delay to avoid multiple triggers
+            await Future.delayed(const Duration(seconds: 2));
+          }
+
+          // Action when blocked app is opened
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('$appName is blocked!')));
         }
       }
 
@@ -822,8 +991,8 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     }
     apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
-    final durationController = TextEditingController(text: '60');
-    final amountController = TextEditingController(text: '1');
+    final durationController = TextEditingController(text: '1');
+    final amountController = TextEditingController(text: '10');
     Set<String> selectedPackages = <String>{};
     String? errorMessage;
 
@@ -986,15 +1155,17 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
   static const String _stakeAbi = '''
 [
   {"inputs":[{"internalType":"uint256","name":"_stakeTime","type":"uint256"}],
-   "name":"stake",
-   "outputs":[],
-   "stateMutability":"payable",
-   "type":"function"}
+   "name":"stake","outputs":[],"stateMutability":"payable","type":"function"},
+  {"inputs":[],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},
+  {"inputs":[],"name":"totalStaked","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],
+   "stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"currentReward","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],
+   "stateMutability":"view","type":"function"}
 ]
 ''';
 
   static final EthereumAddress _stakeContract = EthereumAddress.fromHex(
-    "0xa861f9c3CD9EcBB01ad0aCf0B43a606C4C87269F",
+    "0x3F471b9Fe520c5B8dFe1D92d5f00A846429C797b",
   );
 
   Future<String> _sendStake(double amountFlow, int stakeTimeSeconds) async {
@@ -1051,15 +1222,16 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
     final blockedUntil = DateTime.now().add(request.duration);
     final appNames = request.selectedApps.map((app) => app.name).join(', ');
 
+    // caluclate the num of blocks to stake considering 0.8 seconds per block
+    final numBlocks = (request.duration.inSeconds / 0.8).ceil();
+    // send real tx
     debugPrint(
       'Calling stake: amount=${request.amountFLOW} FLOW, '
-      'duration=${request.duration.inMinutes} minutes, apps=[$appNames]',
+      'duration=${request.duration.inMinutes} minutes, apps=[$appNames] numBlocks=$numBlocks',
     );
-
-    // send real tx
     final txHash = await _sendStake(
       request.amountFLOW, // FLOW amount
-      request.duration.inSeconds, // pass seconds as stakeTime
+      numBlocks, // pass seconds as stakeTime
     );
 
     if (mounted) {
@@ -1157,6 +1329,29 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            if (_isLoggedIn) ...[
+              const SizedBox(height: 8),
+              FilledButton.icon(
+                onPressed: () async {
+                  final tx = await _withdrawStake();
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text("Withdraw tx sent: $tx")),
+                  );
+                  await _loadBalance();
+                  await _loadStakeStats();
+                },
+                icon: const Icon(Icons.download),
+                label: const Text("Withdraw Stake"),
+              ),
+              const SizedBox(height: 12),
+              if (_totalStaked != null && _currentReward != null)
+                Text(
+                  "TVL: $_totalStaked FLOW • Current Reward Pool: $_currentReward FLOW",
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+            ],
+
             Text(
               'Stake & Block',
               style: Theme.of(context).textTheme.titleMedium,
@@ -1215,8 +1410,16 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
               ),
               const SizedBox(height: 8),
               ElevatedButton(
-                onPressed: () =>
-                    _loginWithEmailPasswordless(emailController.text),
+                onPressed: () {
+                  final email = emailController.text.trim();
+                  if (email.isEmpty) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text("Please enter your email")),
+                    );
+                    return;
+                  }
+                  _loginWithEmailPasswordless(email);
+                },
                 child: const Text("Login"),
               ),
             ],
@@ -1428,13 +1631,28 @@ class _ScreenTimeHomePageState extends State<ScreenTimeHomePage>
       appBar: AppBar(
         title: const Text('Doom Stake'),
         actions: [
+          if (_isLoggedIn && _balance != null)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Text(
+                  '$_balance FLOW',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
           IconButton(
             onPressed: _isLoading || !_hasPermission
                 ? null
-                : () => _loadUsageStats(),
+                : () async {
+                    await _loadUsageStats();
+                    await _loadBalance();
+                    await _loadStakeStats();
+                  },
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh stats',
           ),
+
           if (_isLoggedIn) // show logout only when logged in
             IconButton(
               onPressed: _logout,
@@ -1552,6 +1770,7 @@ class _ActiveBlockTile extends StatelessWidget {
         'Time left: ${_formatRemainingDuration(remaining)} • '
         'Stake ${_formatCurrency(entry.stakeAmount)}',
       ),
+
       trailing: IconButton(
         icon: const Icon(Icons.close),
         onPressed: onRemove,
@@ -1871,12 +2090,9 @@ String _formatRemainingDuration(Duration duration) {
   if (duration.isNegative) {
     return 'Expired';
   }
-  final hours = duration.inHours;
-  final minutes = duration.inMinutes.remainder(60);
-  if (hours > 0) {
-    return '${hours}h ${minutes}m';
-  }
-  return '${minutes}m';
+  final minutes = duration.inMinutes;
+  final seconds = duration.inSeconds.remainder(60);
+  return '${minutes} min ${seconds} sec';
 }
 
 String _formatCurrency(double amount) {
